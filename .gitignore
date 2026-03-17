@@ -1,0 +1,13 @@
+# MATLAB autosave / editor backup
+*.asv
+*.m~
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Output folders
+output/
+
+# Optional: logs
+*.log
