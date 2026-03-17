@@ -4,9 +4,14 @@ function params = default_params()
 params = struct();
 
 params.ewald = struct();
+params.ewald.mode = 'nonperiodic';   % 'nonperiodic' or 'periodic_triclinic'
 params.ewald.alpha = 0.25;
 params.ewald.rCut = 12.0;
 params.ewald.kCut = 6;
+params.ewald.boundary = 'tinfoil';
+params.ewald.auto = false;
+params.ewald.tol = 1e-8;
+params.ewald.rcut_fraction = 0.9;
 
 params.scf = struct();
 params.scf.solver = 'matrix_iterative';   % 'iterative', 'matrix_iterative', 'direct'
@@ -15,7 +20,7 @@ params.scf.maxIter = 500;
 params.scf.mixing = 0.5;
 params.scf.initial_mu = [];
 params.scf.softening = 0.0;
-params.scf.use_thole = true;
+params.scf.use_thole = false;
 
 params.field = struct();
 params.field.include_external_charges = true;
