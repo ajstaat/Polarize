@@ -13,6 +13,10 @@ params.ewald.auto = false;
 params.ewald.tol = 1e-8;
 params.ewald.rcut_fraction = 0.9;
 
+% Periodic real-space Thole correction controls
+params.ewald.use_thole_real_space = false;
+params.ewald.thole_a = [];
+
 params.scf = struct();
 params.scf.solver = 'matrix_iterative';   % 'iterative', 'matrix_iterative', 'direct'
 params.scf.tol = 1e-8;
@@ -20,7 +24,7 @@ params.scf.maxIter = 500;
 params.scf.mixing = 0.5;
 params.scf.initial_mu = [];
 params.scf.softening = 0.0;
-params.scf.use_thole = false;
+params.scf.use_thole = true;
 
 params.field = struct();
 params.field.include_external_charges = true;

@@ -4,14 +4,17 @@ function [T, parts, meta] = assemble_periodic_interaction_matrix(sys, ewaldParam
 % Inputs
 %   sys         struct with fields:
 %               .site_pos
-%               .super_lattice   OR .lattice
+%               .site_alpha
 %               .site_is_polarizable
+%               .super_lattice or .lattice
 %
 %   ewaldParams struct with fields:
 %               .alpha
 %               .rcut
 %               .kcut
-%               .boundary   optional, default 'tinfoil'
+%               .boundary              optional, default 'tinfoil'
+%               .use_thole_real_space  optional, default false
+%               .thole_a               optional
 %
 %   scfParams   currently unused, included for API compatibility
 %
@@ -26,6 +29,12 @@ function [T, parts, meta] = assemble_periodic_interaction_matrix(sys, ewaldParam
 %
 % Energy convention:
 %   U = 0.5 * mu_vec' * T * mu_vec
+%
+% Notes
+%   - Optional Thole correction is applied only to the real-space part.
+%   - The correction is:
+%         dT = (l3/x^3) I - (3 l5/x^5) xx^T
+%     added onto the bare Ewald real-space block.
 
 if nargin < 3
     scfParams = struct(); %#ok<NASGU>
@@ -37,12 +46,13 @@ end
 if ~isfield(sys, 'site_is_polarizable') || isempty(sys.site_is_polarizable)
     error('sys.site_is_polarizable is missing or empty.');
 end
+if ~isfield(sys, 'site_alpha') || isempty(sys.site_alpha)
+    error('sys.site_alpha is missing or empty.');
+end
 
 if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
     H = sys.super_lattice.';
 elseif isfield(sys, 'lattice') && ~isempty(sys.lattice)
-    % Your geom layer stores lattice vectors as rows, but the triclinic Ewald
-    % code uses columns. So transpose here.
     H = sys.lattice.';
 else
     error('Need sys.super_lattice or sys.lattice.');
@@ -61,19 +71,39 @@ if isfield(ewaldParams, 'boundary') && ~isempty(ewaldParams.boundary)
     boundary = ewaldParams.boundary;
 end
 
+use_thole_real_space = false;
+if isfield(ewaldParams, 'use_thole_real_space')
+    use_thole_real_space = ewaldParams.use_thole_real_space;
+end
+
+thole_a = [];
+if isfield(ewaldParams, 'thole_a') && ~isempty(ewaldParams.thole_a)
+    thole_a = ewaldParams.thole_a;
+elseif isfield(sys, 'thole_a') && ~isempty(sys.thole_a)
+    thole_a = sys.thole_a;
+end
+
+if use_thole_real_space && isempty(thole_a)
+    error('Real-space Thole correction requested, but no thole_a was provided.');
+end
+
 nSites = sys.n_sites;
 polMask = logical(sys.site_is_polarizable(:));
+site_alpha = sys.site_alpha(:);
 
 Treal = zeros(3*nSites, 3*nSites);
 Trecip = zeros(3*nSites, 3*nSites);
 Tself = zeros(3*nSites, 3*nSites);
 Tsurf = zeros(3*nSites, 3*nSites);
 
-% Precompute k-vectors once
+% Precompute k-vectors
 [kvecs, kmeta] = ewald.enumerate_kvecs_triclinic(H, kcut);
 
 % Real-space image bounds
-a = H(:,1); b = H(:,2); c = H(:,3);
+a = H(:,1);
+b = H(:,2);
+c = H(:,3);
+
 nxmax = ceil(rcut / norm(a)) + 1;
 nymax = ceil(rcut / norm(b)) + 1;
 nzmax = ceil(rcut / norm(c)) + 1;
@@ -82,6 +112,7 @@ for i = 1:nSites
     if ~polMask(i)
         continue;
     end
+
     ii = util.block3(i);
     ri = sys.site_pos(i, :);
 
@@ -92,17 +123,18 @@ for i = 1:nSites
         if ~polMask(j)
             continue;
         end
+
         jj = util.block3(j);
         rj = sys.site_pos(j, :);
 
-        % Surface contribution applies to all pairs for vacuum
+        % Surface contribution
         Tsurf(ii, jj) = ewald.surface_tensor_block_dipole(H, boundary);
 
-        % Reciprocal block
+        % Reciprocal contribution
         Trecip(ii, jj) = ewald.reciprocal_space_tensor_block_triclinic( ...
             ri, rj, H, alpha, kcut, kvecs);
 
-        % Real-space block: sum over images
+        % Real-space contribution
         Tij_real = zeros(3,3);
         rij0 = ri - rj;
 
@@ -122,7 +154,15 @@ for i = 1:nSites
                         continue;
                     end
 
-                    Tij_real = Tij_real + ewald.real_space_tensor_block_triclinic(xvec, alpha);
+                    Tij_block = ewald.real_space_tensor_block_triclinic(xvec, alpha);
+
+                    if use_thole_real_space
+                        Tij_block = Tij_block + ...
+                            ewald.real_space_tensor_block_triclinic_thole_correction( ...
+                                xvec, site_alpha(i), site_alpha(j), thole_a);
+                    end
+
+                    Tij_real = Tij_real + Tij_block;
                 end
             end
         end
@@ -147,4 +187,6 @@ meta.boundary = boundary;
 meta.kcut = kcut;
 meta.rcut = rcut;
 meta.alpha = alpha;
+meta.use_thole_real_space = use_thole_real_space;
+
 end

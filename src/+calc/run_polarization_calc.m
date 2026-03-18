@@ -1,18 +1,5 @@
 function result = run_polarization_calc(crystal, model, opts, params)
 %RUN_POLARIZATION_CALC Main driver for one polarization calculation.
-%
-% Current implemented steps:
-%   1) build working system
-%   2) assign point-charge pattern if provided
-%   3) compute external field from charges
-%   4) build dipole interaction operator (nonperiodic or periodic)
-%   5) solve induced dipoles
-%   6) compute simple polarization energy
-%
-% Notes
-%   - periodic_triclinic currently uses the Ewald dipole matrix operator
-%   - nonperiodic path can still use Thole damping in the SCF kernel
-%   - direct and matrix_iterative solvers use the explicit operator T
 
 if nargin < 4
     error('run_polarization_calc requires crystal, model, opts, and params.');
@@ -39,7 +26,9 @@ Tmeta = struct();
 mu = [];
 scf = struct();
 direct = struct();
-Epol = [];
+energy = struct();
+energy_by_molecule = table();
+dipole_dipole_decomp = struct();
 
 if ~isempty(Eext)
     mode = 'nonperiodic';
@@ -54,7 +43,6 @@ if ~isempty(Eext)
         case 'periodic_triclinic'
             ewaldParams = params.ewald;
 
-            % Optional automatic parameter selection from the system lattice
             if isfield(ewaldParams, 'auto') && ewaldParams.auto
                 if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
                     H = sys.super_lattice.';
@@ -72,7 +60,6 @@ if ~isempty(Eext)
                 ewaldParams.kcut  = pauto.kcut;
                 ewaldParams.boundary = pauto.boundary;
             else
-                % allow older field names rCut/kCut as aliases
                 if ~isfield(ewaldParams, 'rcut') && isfield(ewaldParams, 'rCut')
                     ewaldParams.rcut = ewaldParams.rCut;
                 end
@@ -92,7 +79,6 @@ if ~isempty(Eext)
             [mu, scf] = thole.solve_scf_matrix_iterative(sys, Eext, T, params.scf);
 
         case 'iterative'
-            % This path uses the field-by-field kernel rather than explicit T.
             [mu, scf] = thole.solve_scf_iterative(sys, Eext, params.scf);
 
         case 'direct'
@@ -107,7 +93,9 @@ if ~isempty(Eext)
             error('Unknown SCF solver: %s', params.scf.solver);
     end
 
-    Epol = thole.dipole_energy(sys, mu, Eext);
+    energy = calc.compute_total_energy(sys, mu, Eext, T);
+    energy_by_molecule = calc.compute_total_energy_by_molecule(sys, mu, Eext);
+    dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition(sys, mu, T);
 end
 
 result = struct();
@@ -120,10 +108,11 @@ result.Tmeta = Tmeta;
 result.mu = mu;
 result.scf = scf;
 result.direct = direct;
-result.energy = struct();
-result.energy.polarization = Epol;
+result.energy = energy;
+result.energy_by_molecule = energy_by_molecule;
+result.dipole_dipole_decomposition = dipole_dipole_decomp;
 
-result.status = 'operator-integrated stage complete';
-result.message = 'System built, charges assigned, operator assembled, induced dipoles solved.';
+result.status = 'energy-reporting stage complete';
+result.message = 'System built, operator assembled, induced dipoles solved, energy breakdown reported.';
 
 end

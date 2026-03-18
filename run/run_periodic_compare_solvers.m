@@ -90,11 +90,29 @@ dmu = res_iter.mu - res_dir.mu;
 err = max(sqrt(sum(dmu.^2, 2)));
 
 fprintf('Max |delta mu|         = %.16e\n', err);
-fprintf('Direct Epol            = %.16e\n', res_dir.energy.polarization);
-fprintf('Iterative Epol         = %.16e\n', res_iter.energy.polarization);
+fprintf('Direct U_total         = %.16e\n', res_dir.energy.total);
+fprintf('Iterative U_total      = %.16e\n', res_iter.energy.total);
 fprintf('Iterative converged    = %d\n', res_iter.scf.converged);
 fprintf('Iterative iterations   = %d\n', res_iter.scf.nIter);
 
 if isfield(res_dir, 'direct') && isfield(res_dir.direct, 'residual_norm')
     fprintf('Direct residual norm   = %.16e\n', res_dir.direct.residual_norm);
 end
+
+disp('Direct energy breakdown:')
+disp(res_dir.energy)
+
+disp('Iterative energy breakdown:')
+disp(res_iter.energy)
+
+disp('Per-molecule local energy table (direct):')
+disp(res_dir.energy_by_molecule)
+
+io.pretty_print_result(res_dir)
+io.pretty_print_result(res_iter)
+
+disp('Direct dipole-dipole decomposition:')
+disp(res_dir.dipole_dipole_decomposition)
+
+disp('Iterative dipole-dipole decomposition:')
+disp(res_iter.dipole_dipole_decomposition)
