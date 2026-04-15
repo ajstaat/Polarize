@@ -51,8 +51,8 @@ crystal.site_type  = {'C';  'H';  'N';  'H' };
 model = struct();
 model.polarizable_types = {'C', 'N'};
 model.alpha_by_type = struct();
-model.alpha_by_type.C = 10.0;
-model.alpha_by_type.N = 8.0;
+model.alpha_by_type.C = 1.334;
+model.alpha_by_type.N = 1.075;
 model.thole_a = 0.39;
 
 % Put charge pattern on active molecules
@@ -96,7 +96,10 @@ params_bare.ewald.tol = 1e-8;
 params_bare.ewald.boundary = 'tinfoil';
 params_bare.ewald.rcut_fraction = 0.9;
 params_bare.ewald.use_thole_real_space = false;
-params_bare.scf.solver = 'direct';
+params_bare.scf.solver = 'sor';
+params_bare.scf.omega = 0.9;     % under-relaxed GS
+params_bare.scf.tol = 1e-8;
+params_bare.scf.maxIter = 1000;
 
 res_bare = calc.run_polarization_calc(crystal, model, opts, params_bare);
 
@@ -111,7 +114,10 @@ params_thole.ewald.boundary = 'tinfoil';
 params_thole.ewald.rcut_fraction = 0.9;
 params_thole.ewald.use_thole_real_space = true;
 params_thole.ewald.thole_a = model.thole_a;
-params_thole.scf.solver = 'direct';
+params_thole.scf.solver = 'sor';
+params_thole.scf.omega = 0.9;     % under-relaxed GS
+params_thole.scf.tol = 1e-8;
+params_thole.scf.maxIter = 1000;
 
 res_thole = calc.run_polarization_calc(crystal, model, opts, params_thole);
 

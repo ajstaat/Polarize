@@ -86,8 +86,17 @@ dmu = res_iter.mu - res_dir.mu;
 err = max(sqrt(sum(dmu.^2, 2)));
 
 fprintf('Max |delta mu| = %.16e\n', err);
-fprintf('Iterative Epol = %.16e\n', res_iter.energy.polarization);
-fprintf('Direct    Epol = %.16e\n', res_dir.energy.polarization);
+fprintf('Iterative E(total) = %.16e\n', res_iter.energy.total);
+fprintf('Direct    E(total) = %.16e\n', res_dir.energy.total);
+
+fprintf('Iterative polarization_self      = %.16e\n', res_iter.energy.polarization_self);
+fprintf('Direct    polarization_self      = %.16e\n', res_dir.energy.polarization_self);
+
+fprintf('Iterative external_charge_dipole = %.16e\n', res_iter.energy.external_charge_dipole);
+fprintf('Direct    external_charge_dipole = %.16e\n', res_dir.energy.external_charge_dipole);
+
+fprintf('Iterative dipole_dipole          = %.16e\n', res_iter.energy.dipole_dipole);
+fprintf('Direct    dipole_dipole          = %.16e\n', res_dir.energy.dipole_dipole);
 
 if isfield(res_dir, 'direct') && isfield(res_dir.direct, 'residual_norm')
     fprintf('Direct residual norm = %.16e\n', res_dir.direct.residual_norm);
