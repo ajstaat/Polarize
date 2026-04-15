@@ -1,7 +1,7 @@
-function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
-%SOLVE_SCF_SOR Solve induced dipoles by block GS / SOR sweeps on T.
+function [mu, scf] = solve_scf_sor(problem, Tpol)
+%SOLVE_SCF_SOR Solve induced dipoles by block GS / SOR sweeps on Tpol.
 %
-% Uses the fixed-point form
+% Uses the fixed-point form on the polarizable-only active space:
 %   mu_i = alpha_i * (Eext_i + sum_j T_ij mu_j)
 %
 % with Gauss-Seidel / SOR ordering:
@@ -12,85 +12,42 @@ function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
 % 0 < omega < 1 -> under-relaxed GS
 % 1 < omega < 2 -> SOR
 
-    nSites = sys.n_sites;
+    nSites    = problem.nSites;
+    nPolSites = problem.nPolSites;
 
-    if ~isequal(size(Eext), [nSites, 3])
-        error('Eext must be N x 3.');
-    end
-    if ~isequal(size(T), [3*nSites, 3*nSites])
-        error('T must be 3N x 3N.');
+    if ~isequal(size(Tpol), [3*nPolSites, 3*nPolSites])
+        error('Tpol must be 3*Np x 3*Np for the active polarizable subspace.');
     end
 
-    % ---------------------------
-    % Parse options
-    % ---------------------------
-    tol = 1e-8;
-    if isfield(scfParams,'tol') && ~isempty(scfParams.tol)
-        tol = scfParams.tol;
+    activeSites   = problem.activeSites(:);
+    alpha_pol     = problem.alpha_pol(:);
+    Eext_pol      = problem.Eext_pol;
+    mu_pol        = problem.mu0_pol;
+
+    tol           = problem.tol;
+    maxIter       = problem.maxIter;
+    omega         = problem.omega;
+    verbose       = problem.verbose;
+    printEvery    = problem.printEvery;
+    residualEvery = problem.residualEvery;
+
+    stopMetric = "max_dmu";
+    if isfield(problem, 'stopMetric') && ~isempty(problem.stopMetric)
+        stopMetric = lower(string(problem.stopMetric));
     end
 
-    maxIter = 1000;
-    if isfield(scfParams,'maxIter') && ~isempty(scfParams.maxIter)
-        maxIter = scfParams.maxIter;
-    end
-
-    omega = 1.0;
-    if isfield(scfParams,'omega') && ~isempty(scfParams.omega)
-        omega = scfParams.omega;
-    end
     if omega <= 0 || omega >= 2
-        error('scfParams.omega must satisfy 0 < omega < 2.');
+        error('problem.omega must satisfy 0 < omega < 2.');
     end
 
-    verbose = false;
-    if isfield(scfParams,'verbose') && ~isempty(scfParams.verbose)
-        verbose = logical(scfParams.verbose);
+    % Precompute active-space right-hand side for residual diagnostics:
+    % b = A * Eext, with isotropic site alpha
+    bpol = zeros(3*nPolSites, 1);
+    for k = 1:nPolSites
+        Ik = (3*k-2):(3*k);
+        bpol(Ik) = alpha_pol(k) * Eext_pol(k,:).';
     end
-
-    printEvery = 10;
-    if isfield(scfParams,'printEvery') && ~isempty(scfParams.printEvery)
-        printEvery = scfParams.printEvery;
-    end
-
-    residualEvery = 25;
-    if isfield(scfParams,'residualEvery') && ~isempty(scfParams.residualEvery)
-        residualEvery = scfParams.residualEvery;
-    end
-
-    polMask = logical(sys.site_is_polarizable(:));
-    alpha   = sys.site_alpha(:);
-
-    if numel(polMask) ~= nSites || numel(alpha) ~= nSites
-        error('sys.site_is_polarizable and sys.site_alpha must both have length nSites.');
-    end
-
-    if isfield(scfParams,'initial_mu') && ~isempty(scfParams.initial_mu)
-        mu = scfParams.initial_mu;
-        if ~isequal(size(mu), [nSites, 3])
-            error('scfParams.initial_mu must be N x 3.');
-        end
-    else
-        mu = zeros(nSites, 3);
-    end
-
-    activeIdx = find(polMask);
-    nActive = numel(activeIdx);
-
-    % Precompute block indices once.
-    blkStart = 3*activeIdx - 2;
-    blkMid   = 3*activeIdx - 1;
-    blkEnd   = 3*activeIdx;
-    blocks   = [blkStart, blkMid, blkEnd];
-
-    % Precompute right-hand normalization vector b = A*Eext for residuals.
-    % Only used for occasional diagnostics.
-    b = zeros(3*nSites, 1);
-    for k = 1:nActive
-        i = activeIdx(k);
-        Ii = blocks(k,1):blocks(k,3);
-        b(Ii) = alpha(i) * Eext(i,:).';
-    end
-    bn = norm(b);
+    bn = norm(bpol);
     if bn == 0
         bn = 1.0;
     end
@@ -105,45 +62,50 @@ function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
         else
             solverName = 'SOR';
         end
-        fprintf('SCF(%s): tol=%.3e, maxIter=%d, omega=%.3f\n', ...
-            solverName, tol, maxIter, omega);
+        fprintf('SCF(%s): tol=%.3e, maxIter=%d, omega=%.3f, nPol=%d\n', ...
+            solverName, tol, maxIter, omega, nPolSites);
     end
 
     for iter = 1:maxIter
-        mu_old = mu;
+        mu_old_pol = mu_pol;
 
-        for k = 1:nActive
-            i = activeIdx(k);
-            Ii = blocks(k,1):blocks(k,3);
+        % Stack once per sweep so we can use block matvecs
+        mu_pol_vec     = util.stack_xyz(mu_pol);
+        mu_old_pol_vec = util.stack_xyz(mu_old_pol);
 
-            % Start from external field at site i
-            E_loc = Eext(i,:).';
+        for k = 1:nPolSites
+            Ik = (3*k-2):(3*k);
 
-            % Earlier active sites: use newest mu
-            for j = 1:(k-1)
-                jj = activeIdx(j);
-                Jj = blocks(j,1):blocks(j,3);
-                E_loc = E_loc + T(Ii, Jj) * mu(jj,:).';
+            E_loc = Eext_pol(k,:).';
+
+            % Earlier active sites: newest values
+            if k > 1
+                Jprev = 1:(3*(k-1));
+                E_loc = E_loc + Tpol(Ik, Jprev) * mu_pol_vec(Jprev);
             end
 
-            % Later active sites: use previous-iteration mu
-            for j = (k+1):nActive
-                jj = activeIdx(j);
-                Jj = blocks(j,1):blocks(j,3);
-                E_loc = E_loc + T(Ii, Jj) * mu_old(jj,:).';
+            % Later active sites: previous-iteration values
+            if k < nPolSites
+                Jnext = (3*k+1):(3*nPolSites);
+                E_loc = E_loc + Tpol(Ik, Jnext) * mu_old_pol_vec(Jnext);
             end
 
-            mu_gs_i = alpha(i) * E_loc;
-            mu(i,:) = ((1 - omega) * mu_old(i,:).' + omega * mu_gs_i).';
+            mu_gs_k = alpha_pol(k) * E_loc;
+            mu_pol(k,:) = ((1 - omega) * mu_old_pol(k,:).' + omega * mu_gs_k).';
+
+            % Keep stacked "newest values" vector in sync for subsequent rows
+            mu_pol_vec(Ik) = mu_pol(k,:).';
         end
 
-        dmu = mu - mu_old;
-        err = max(sqrt(sum(dmu.^2, 2)));
+        dmu_pol = mu_pol - mu_old_pol;
+        err = max(sqrt(sum(dmu_pol.^2, 2)));
         history(iter) = err;
 
-        doResidual = (iter == 1) || (mod(iter, residualEvery) == 0) || (err < tol);
+        doResidual = strcmp(stopMetric, "relres") || ...
+                     (iter == 1) || (mod(iter, residualEvery) == 0) || (err < tol);
+
         if doResidual
-            relres = local_relres_from_T(mu, T, alpha, polMask, Eext, b, bn);
+            relres = thole.compute_active_space_relres(problem, Tpol, mu_pol);
             relresHistory(iter) = relres;
         else
             relres = NaN;
@@ -157,8 +119,18 @@ function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
             end
         end
 
-        if err < tol
-            converged = true;
+        switch stopMetric
+            case "relres"
+                if ~isnan(relres) && relres < tol
+                    converged = true;
+                end
+            otherwise
+                if err < tol
+                    converged = true;
+                end
+        end
+
+        if converged
             history = history(1:iter);
             relresHistory = relresHistory(1:iter);
             break;
@@ -168,6 +140,11 @@ function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
     if ~converged
         history = history(1:maxIter);
         relresHistory = relresHistory(1:maxIter);
+    end
+
+    mu = zeros(nSites, 3);
+    if nPolSites > 0
+        mu(activeSites, :) = mu_pol;
     end
 
     scf = struct();
@@ -184,23 +161,5 @@ function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
     end
     scf.relres = lastRelres;
     scf.used_matrix_solver = true;
-end
-
-function relres = local_relres_from_T(mu, T, alpha, polMask, Eext, b, bn)
-% Compute || b - (I - A*T) mu || / ||b|| without building A or M.
-
-    nSites = size(mu,1);
-    mu_vec = util.stack_xyz(mu);
-    Tmu = T * mu_vec;
-
-    r = b - mu_vec;
-
-    activeIdx = find(polMask);
-    for k = 1:numel(activeIdx)
-        i = activeIdx(k);
-        Ii = (3*i-2):(3*i);
-        r(Ii) = r(Ii) + alpha(i) * Tmu(Ii);
-    end
-
-    relres = norm(r) / bn;
+    scf.nPolSites = nPolSites;
 end

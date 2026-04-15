@@ -14,6 +14,11 @@ function result = run_polarization_calc(crystal, model, opts, params)
 %   'iterative', 'fixed_point'
 %   'gs', 'sor', 'gauss_seidel'
 %   'direct'
+%
+% Notes on current refactor state:
+%   - nonperiodic mode uses active-space (polarizable-only) operator assembly
+%     and the new problem-preparation interface
+%   - periodic_triclinic mode remains on the legacy full-space path for now
 
     if nargin < 4
         error('run_polarization_calc requires crystal, model, opts, and params.');
@@ -30,45 +35,24 @@ function result = run_polarization_calc(crystal, model, opts, params)
         verbose = logical(params.output.verbose);
     end
 
-        % 6) Requested outputs
-        if computeEnergy || computeEnergyByMolecule || computeDipoleDipoleDecomp
-            tEnergy = tic;
-            if verbose
-                fprintf('Computing requested post-SCF outputs...\n');
-            end
+    % ---------------------------
+    % Requested outputs
+    % ---------------------------
+    computeEnergy = false;
+    computeEnergyByMolecule = false;
+    computeDipoleDipoleDecomp = false;
 
-            if computeEnergy
-                energy = calc.compute_total_energy(sys, mu, Eext, T);
-            else
-                energy = struct();
-            end
-
-            if computeEnergyByMolecule
-                energy_by_molecule = calc.compute_total_energy_by_molecule(sys, mu, Eext);
-            else
-                energy_by_molecule = table();
-            end
-
-            if computeDipoleDipoleDecomp
-                dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition(sys, mu, T);
-            else
-                dipole_dipole_decomp = struct();
-            end
-
-            if verbose
-                fprintf('Post-SCF analysis finished in %.2f s\n', toc(tEnergy));
-                if isfield(energy, 'total')
-                    fprintf('Total polarization energy: %.10f\n', energy.total);
-                end
-            end
-        else
-            if verbose
-                fprintf('Skipping post-SCF energy/decomposition outputs.\n');
-            end
-            energy = struct();
-            energy_by_molecule = table();
-            dipole_dipole_decomp = struct();
-        end    
+    if isfield(params, 'output') && ~isempty(params.output)
+        if isfield(params.output, 'computeEnergy') && ~isempty(params.output.computeEnergy)
+            computeEnergy = logical(params.output.computeEnergy);
+        end
+        if isfield(params.output, 'computeEnergyByMolecule') && ~isempty(params.output.computeEnergyByMolecule)
+            computeEnergyByMolecule = logical(params.output.computeEnergyByMolecule);
+        end
+        if isfield(params.output, 'computeDipoleDipoleDecomp') && ~isempty(params.output.computeDipoleDipoleDecomp)
+            computeDipoleDipoleDecomp = logical(params.output.computeDipoleDipoleDecomp);
+        end
+    end
 
     % ---------------------------
     % 1) Build system
@@ -172,10 +156,15 @@ function result = run_polarization_calc(crystal, model, opts, params)
         end
     end
 
+    % ---------------------------
     % Initialize outputs so result is always complete
+    % ---------------------------
     T = [];
+    Tpol = [];
     Tparts = struct();
     Tmeta = struct();
+    opinfo = struct();
+    problem = [];
     mu = [];
     scf = struct();
     direct = struct();
@@ -191,21 +180,34 @@ function result = run_polarization_calc(crystal, model, opts, params)
         if isfield(params, 'ewald') && isfield(params.ewald, 'mode') && ~isempty(params.ewald.mode)
             mode = params.ewald.mode;
         end
+        modeStr = lower(char(string(mode)));
 
         if verbose
-            fprintf('Operator mode: %s\n', mode);
+            fprintf('Operator mode: %s\n', modeStr);
         end
+
+        % Prepare normalized SCF problem once.
+        % This is used immediately in nonperiodic mode and can later become
+        % the common path for periodic mode too.
+        problem = thole.prepare_scf_problem(sys, Eext, params.scf);
 
         % 4) Assemble operator
         tOp = tic;
-        switch lower(string(mode))
-            case "nonperiodic"
+        switch modeStr
+            case 'nonperiodic'
                 if verbose
                     fprintf('Assembling nonperiodic interaction matrix...\n');
                 end
-                T = ewald.assemble_nonperiodic_interaction_matrix(sys, params.ewald, params.scf);
 
-            case "periodic_triclinic"
+                [Tpol, opinfo] = ewald.assemble_nonperiodic_interaction_matrix( ...
+                    sys, problem, params.ewald, params.scf);
+
+                % Keep T empty unless we later need the legacy full-space
+                % operator for post-SCF energy/decomposition routines.
+                T = [];
+                Tmeta = opinfo;
+
+            case 'periodic_triclinic'
                 if verbose
                     fprintf('Assembling periodic triclinic interaction matrix...\n');
                 end
@@ -248,7 +250,7 @@ function result = run_polarization_calc(crystal, model, opts, params)
                 [T, Tparts, Tmeta] = ewald.assemble_periodic_interaction_matrix(sys, ewaldParams, params.scf);
 
             otherwise
-                error('Unknown operator mode: %s', mode);
+                error('Unknown operator mode: %s', modeStr);
         end
 
         if verbose
@@ -264,16 +266,29 @@ function result = run_polarization_calc(crystal, model, opts, params)
         solver = lower(string(params.scf.solver));
         switch solver
             case {"matrix_iterative", "matrix", "jacobi"}
-                [mu, scf] = thole.solve_scf_matrix_iterative(sys, Eext, T, params.scf);
+                if strcmp(modeStr, 'nonperiodic')
+                    [mu, scf] = thole.solve_scf_matrix_iterative(problem, Tpol);
+                else
+                    [mu, scf] = thole.solve_scf_matrix_iterative(sys, Eext, T, params.scf);
+                end
 
             case {"iterative", "fixed_point"}
+                % legacy pairwise implementation kept for validation/debug
                 [mu, scf] = thole.solve_scf_iterative(sys, Eext, params.scf);
 
             case {"gs", "sor", "gauss_seidel"}
-                [mu, scf] = thole.solve_scf_sor(sys, Eext, T, params.scf);
+                if strcmp(modeStr, 'nonperiodic')
+                    [mu, scf] = thole.solve_scf_sor(problem, Tpol);
+                else
+                    [mu, scf] = thole.solve_scf_sor(sys, Eext, T, params.scf);
+                end
 
             case {"direct"}
-                [mu, direct] = thole.solve_scf_direct(sys, Eext, T);
+                if strcmp(modeStr, 'nonperiodic')
+                    [mu, direct] = thole.solve_scf_direct(problem, Tpol);
+                else
+                    [mu, direct] = thole.solve_scf_direct(sys, Eext, T);
+                end
                 scf = struct();
                 scf.method = 'direct';
                 scf.converged = true;
@@ -302,19 +317,31 @@ function result = run_polarization_calc(crystal, model, opts, params)
             end
 
             if computeEnergy
-                energy = calc.compute_total_energy(sys, mu, Eext, T);
+                if strcmp(modeStr, 'nonperiodic')
+                    energy = calc.compute_total_energy_active_space(sys, problem, mu, Eext, Tpol);
+                else
+                    energy = calc.compute_total_energy(sys, mu, Eext, T);
+                end
             else
                 energy = struct();
             end
 
             if computeEnergyByMolecule
-                energy_by_molecule = calc.compute_total_energy_by_molecule(sys, mu, Eext);
+                if strcmp(modeStr, 'nonperiodic')
+                    energy_by_molecule = calc.compute_total_energy_by_molecule_active_space(sys, problem, mu, Eext, Tpol);
+                else
+                    energy_by_molecule = calc.compute_total_energy_by_molecule(sys, mu, Eext);
+                end
             else
                 energy_by_molecule = table();
             end
 
             if computeDipoleDipoleDecomp
-                dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition(sys, mu, T);
+                if strcmp(modeStr, 'nonperiodic')
+                    dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition_active_space(sys, problem, mu, Tpol);
+                else
+                    dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition(sys, mu, T);
+                end
             else
                 dipole_dipole_decomp = struct();
             end
@@ -355,8 +382,10 @@ function result = run_polarization_calc(crystal, model, opts, params)
     result.params = params;
     result.Eext = Eext;
     result.T = T;
+    result.Tpol = Tpol;
     result.Tparts = Tparts;
     result.Tmeta = Tmeta;
+    result.problem = problem;
     result.mu = mu;
     result.scf = scf;
     result.direct = direct;

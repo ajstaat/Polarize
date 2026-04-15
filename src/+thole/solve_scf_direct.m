@@ -1,34 +1,46 @@
-function [mu, direct] = solve_scf_direct(sys, Eext, T)
-%SOLVE_SCF_DIRECT Solve induced dipoles by direct linear solve.
+function [mu, direct] = solve_scf_direct(problem, Tpol)
+%SOLVE_SCF_DIRECT Solve induced dipoles by direct linear solve in active space.
 %
-% Solves:
-%   (I - A*T) mu = A * Eext
+% Solves
+%   (I - A*T) mu = A*Eext
 %
-% where A is the block-diagonal polarizability matrix.
+% on the polarizable-only active space, then expands the result back to the
+% full N x 3 dipole array.
 
-    nSites = sys.n_sites;
+    nSites    = problem.nSites;
+    nPolSites = problem.nPolSites;
 
-    if ~isequal(size(Eext), [nSites, 3])
-        error('Eext must be N x 3.');
+    if ~isequal(size(Tpol), [3*nPolSites, 3*nPolSites])
+        error('Tpol must be 3*Np x 3*Np for the active polarizable subspace.');
     end
 
-    if ~isequal(size(T), [3*nSites, 3*nSites])
-        error('T must be 3N x 3N.');
+    activeSites    = problem.activeSites;
+    alpha_pol_vec  = problem.alpha_pol_vec;
+    Eext_pol_vec   = problem.Eext_pol_vec;
+
+    % Build active-space linear system:
+    %   (I - A*T) mu = A*Eext
+    Ipol = eye(3*nPolSites);
+    Mpol = Ipol - (alpha_pol_vec .* Tpol);
+    bpol = alpha_pol_vec .* Eext_pol_vec;
+
+    mu_pol_vec = Mpol \ bpol;
+
+    % Expand back to full N x 3 array
+    mu = zeros(nSites, 3);
+    if nPolSites > 0
+        mu(activeSites, :) = util.unstack_xyz(mu_pol_vec);
     end
 
-    A = thole.build_alpha_matrix(sys);
-    Eext_vec = util.stack_xyz(Eext);
-
-    M = eye(3*nSites) - A * T;
-    b = A * Eext_vec;
-
-    mu_vec = M \ b;
-    mu = util.unstack_xyz(mu_vec);
-
-    residual = M * mu_vec - b;
+    % Diagnostics
+    r = bpol - Mpol * mu_pol_vec;
+    residual_norm = norm(r);
+    relres = thole.compute_active_space_relres(problem, Tpol, mu);
 
     direct = struct();
     direct.method = 'direct';
-    direct.residual_norm = norm(residual);
     direct.used_matrix_solver = true;
+    direct.nPolSites = nPolSites;
+    direct.residual_norm = residual_norm;
+    direct.relres = relres;
 end
