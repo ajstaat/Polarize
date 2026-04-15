@@ -137,7 +137,7 @@ opts.activeMolIDs = [refUID, nbrUID];
 opts.depolarizeActiveMolecules = true;
 
 params = util.default_params();
-params.scf.solver = 'gs';
+params.scf.solver = 'jacobi';
 params.scf.verbose = true;
 params.scf.printEvery = 100;
 params.ewald.mode = 'nonperiodic';

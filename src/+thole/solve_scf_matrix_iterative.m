@@ -1,47 +1,27 @@
 function [mu, scf] = solve_scf_matrix_iterative(sys, Eext, T, scfParams)
 %SOLVE_SCF_MATRIX_ITERATIVE Solve SCF using explicit interaction matrix T.
+%
+% Fixed-point / Jacobi-style update with optional linear mixing:
+%   mu <- (1-mixing)*mu + mixing*A*(Eext + T*mu)
 
-    nSites = sys.n_sites;
-    if ~isequal(size(Eext), [nSites, 3])
-        error('Eext must be N x 3.');
-    end
+    problem = thole.prepare_scf_problem(sys, Eext, scfParams);
+
+    nSites = problem.nSites;
     if ~isequal(size(T), [3*nSites, 3*nSites])
         error('T must be 3N x 3N.');
     end
 
-    tol = 1e-8;
-    if isfield(scfParams, 'tol'), tol = scfParams.tol; end
+    polMask = problem.polMask;
+    alpha   = problem.alpha;
 
-    maxIter = 500;
-    if isfield(scfParams, 'maxIter'), maxIter = scfParams.maxIter; end
+    mu_vec  = problem.mu0_vec;
+    Eext_vec = problem.Eext_vec;
 
-    mixing = 0.5;
-    if isfield(scfParams, 'mixing'), mixing = scfParams.mixing; end
-
-    verbose = false;
-    if isfield(scfParams, 'verbose') && ~isempty(scfParams.verbose)
-        verbose = logical(scfParams.verbose);
-    end
-
-    printEvery = 10;
-    if isfield(scfParams, 'printEvery') && ~isempty(scfParams.printEvery)
-        printEvery = scfParams.printEvery;
-    end
-
-    if isfield(scfParams, 'initial_mu') && ~isempty(scfParams.initial_mu)
-        mu = scfParams.initial_mu;
-        if ~isequal(size(mu), [nSites, 3])
-            error('scfParams.initial_mu must be N x 3.');
-        end
-    else
-        mu = zeros(nSites, 3);
-    end
-
-    polMask = logical(sys.site_is_polarizable(:));
-    alpha = sys.site_alpha(:);
-
-    Eext_vec = util.stack_xyz(Eext);
-    mu_vec = util.stack_xyz(mu);
+    tol       = problem.tol;
+    maxIter   = problem.maxIter;
+    mixing    = problem.mixing;
+    verbose   = problem.verbose;
+    printEvery = problem.printEvery;
 
     history = zeros(maxIter, 1);
     converged = false;
@@ -52,6 +32,7 @@ function [mu, scf] = solve_scf_matrix_iterative(sys, Eext, T, scfParams)
     end
 
     tSCF = tic;
+
     for iter = 1:maxIter
         Edip_vec = T * mu_vec;
         Etot_vec = Eext_vec + Edip_vec;
@@ -59,9 +40,10 @@ function [mu, scf] = solve_scf_matrix_iterative(sys, Eext, T, scfParams)
 
         mu_new = zeros(nSites, 3);
         mu_new(polMask, :) = alpha(polMask) .* Etot(polMask, :);
-        mu_new_vec = util.stack_xyz(mu_new);
 
+        mu_new_vec = util.stack_xyz(mu_new);
         mu_mixed_vec = (1 - mixing) * mu_vec + mixing * mu_new_vec;
+
         delta_vec = mu_mixed_vec - mu_vec;
         delta = util.unstack_xyz(delta_vec);
         err = max(sqrt(sum(delta.^2, 2)));
@@ -70,12 +52,13 @@ function [mu, scf] = solve_scf_matrix_iterative(sys, Eext, T, scfParams)
         mu_vec = mu_mixed_vec;
 
         if verbose && (iter == 1 || mod(iter, printEvery) == 0 || err < tol)
-            fprintf('  iter %4d | max|dmu| = %.3e\n', iter, err);
+            fprintf(' iter %4d | max|dmu| = %.3e\n', iter, err);
         end
 
         if err < tol
             converged = true;
             history = history(1:iter);
+
             if verbose
                 fprintf('SCF(matrix_iterative) converged in %d iterations (%.2f s)\n', ...
                     iter, toc(tSCF));
@@ -93,7 +76,9 @@ function [mu, scf] = solve_scf_matrix_iterative(sys, Eext, T, scfParams)
     end
 
     mu = util.unstack_xyz(mu_vec);
+
     scf = struct();
+    scf.method = 'matrix_iterative';
     scf.converged = converged;
     scf.nIter = numel(history);
     scf.history = history;

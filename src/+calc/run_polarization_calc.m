@@ -7,7 +7,7 @@ function result = run_polarization_calc(crystal, model, opts, params)
 %   3) build external field from assigned charges
 %   4) assemble dipole interaction operator
 %   5) solve induced dipoles
-%   6) compute energy breakdown
+%   6) optionally compute energy breakdown
 %
 % Supported SCF solver names:
 %   'matrix_iterative', 'matrix', 'jacobi'
@@ -30,9 +30,45 @@ function result = run_polarization_calc(crystal, model, opts, params)
         verbose = logical(params.output.verbose);
     end
 
-    if verbose
-        fprintf('\n=== run_polarization_calc ===\n');
-    end
+        % 6) Requested outputs
+        if computeEnergy || computeEnergyByMolecule || computeDipoleDipoleDecomp
+            tEnergy = tic;
+            if verbose
+                fprintf('Computing requested post-SCF outputs...\n');
+            end
+
+            if computeEnergy
+                energy = calc.compute_total_energy(sys, mu, Eext, T);
+            else
+                energy = struct();
+            end
+
+            if computeEnergyByMolecule
+                energy_by_molecule = calc.compute_total_energy_by_molecule(sys, mu, Eext);
+            else
+                energy_by_molecule = table();
+            end
+
+            if computeDipoleDipoleDecomp
+                dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition(sys, mu, T);
+            else
+                dipole_dipole_decomp = struct();
+            end
+
+            if verbose
+                fprintf('Post-SCF analysis finished in %.2f s\n', toc(tEnergy));
+                if isfield(energy, 'total')
+                    fprintf('Total polarization energy: %.10f\n', energy.total);
+                end
+            end
+        else
+            if verbose
+                fprintf('Skipping post-SCF energy/decomposition outputs.\n');
+            end
+            energy = struct();
+            energy_by_molecule = table();
+            dipole_dipole_decomp = struct();
+        end    
 
     % ---------------------------
     % 1) Build system
@@ -41,9 +77,7 @@ function result = run_polarization_calc(crystal, model, opts, params)
     if verbose
         fprintf('Building crystal system...\n');
     end
-
     sys = builder.make_crystal_system(crystal, model, opts);
-
     if verbose
         nUniqueMol = numel(unique(sys.site_mol_id));
         fprintf('Built system in %.2f s: %d sites, %d unique molecule images\n', ...
@@ -59,7 +93,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
         end
 
         tCharge = tic;
-
         if isfield(model, 'charge_patterns') && ~isempty(model.charge_patterns)
             if verbose
                 fprintf('Assigning %d molecule-specific charge patterns...\n', ...
@@ -77,8 +110,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
             if verbose
                 fprintf('No charge pattern supplied.\n');
             end
-
-            % make sure site_charge exists even if no pattern was supplied
             if ~isfield(sys, 'site_charge') || isempty(sys.site_charge)
                 sys.site_charge = zeros(sys.n_sites, 1);
             end
@@ -91,8 +122,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
         if verbose
             fprintf('No active molecules selected.\n');
         end
-
-        % make sure site_charge exists in the neutral case
         if ~isfield(sys, 'site_charge') || isempty(sys.site_charge)
             sys.site_charge = zeros(sys.n_sites, 1);
         end
@@ -124,14 +153,11 @@ function result = run_polarization_calc(crystal, model, opts, params)
     if hasCharges
         if isfield(params, 'field') && isfield(params.field, 'include_external_charges') ...
                 && params.field.include_external_charges
-
             tField = tic;
             if verbose
                 fprintf('Computing external field from assigned charges...\n');
             end
-
             Eext = calc.compute_external_field(sys, params);
-
             if verbose
                 fprintf('External field computed in %.2f s\n', toc(tField));
             end
@@ -158,7 +184,7 @@ function result = run_polarization_calc(crystal, model, opts, params)
     dipole_dipole_decomp = struct();
 
     % ---------------------------
-    % 4–6) Assemble operator, solve, compute energies
+    % 4–6) Assemble operator, solve, compute requested outputs
     % ---------------------------
     if ~isempty(Eext)
         mode = 'nonperiodic';
@@ -183,7 +209,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
                 if verbose
                     fprintf('Assembling periodic triclinic interaction matrix...\n');
                 end
-
                 ewaldParams = params.ewald;
 
                 if isfield(ewaldParams, 'auto') && ewaldParams.auto
@@ -212,7 +237,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
                             ewaldParams.alpha, ewaldParams.rcut, ewaldParams.kcut);
                     end
                 else
-                    % compatibility with alternate field names
                     if ~isfield(ewaldParams, 'rcut') && isfield(ewaldParams, 'rCut')
                         ewaldParams.rcut = ewaldParams.rCut;
                     end
@@ -238,7 +262,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
         end
 
         solver = lower(string(params.scf.solver));
-
         switch solver
             case {"matrix_iterative", "matrix", "jacobi"}
                 [mu, scf] = thole.solve_scf_matrix_iterative(sys, Eext, T, params.scf);
@@ -251,7 +274,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
 
             case {"direct"}
                 [mu, direct] = thole.solve_scf_direct(sys, Eext, T);
-
                 scf = struct();
                 scf.method = 'direct';
                 scf.converged = true;
@@ -265,7 +287,6 @@ function result = run_polarization_calc(crystal, model, opts, params)
 
         if verbose
             fprintf('SCF solve finished in %.2f s\n', toc(tSolve));
-
             if isfield(scf, 'method') && strcmpi(scf.method, 'direct')
                 fprintf('Direct solve completed.\n');
             elseif isfield(scf, 'converged')
@@ -273,28 +294,52 @@ function result = run_polarization_calc(crystal, model, opts, params)
             end
         end
 
-        % 6) Energies
-        tEnergy = tic;
-        if verbose
-            fprintf('Computing energies...\n');
-        end
-
-        energy = calc.compute_total_energy(sys, mu, Eext, T);
-        energy_by_molecule = calc.compute_total_energy_by_molecule(sys, mu, Eext);
-        dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition(sys, mu, T);
-
-        if verbose
-            fprintf('Energy analysis finished in %.2f s\n', toc(tEnergy));
-            if isfield(energy, 'total')
-                fprintf('Total polarization energy: %.10f\n', energy.total);
+        % 6) Requested outputs
+        if computeEnergy || computeEnergyByMolecule || computeDipoleDipoleDecomp
+            tEnergy = tic;
+            if verbose
+                fprintf('Computing requested post-SCF outputs...\n');
             end
+
+            if computeEnergy
+                energy = calc.compute_total_energy(sys, mu, Eext, T);
+            else
+                energy = struct();
+            end
+
+            if computeEnergyByMolecule
+                energy_by_molecule = calc.compute_total_energy_by_molecule(sys, mu, Eext);
+            else
+                energy_by_molecule = table();
+            end
+
+            if computeDipoleDipoleDecomp
+                dipole_dipole_decomp = calc.compute_dipole_dipole_decomposition(sys, mu, T);
+            else
+                dipole_dipole_decomp = struct();
+            end
+
+            if verbose
+                fprintf('Post-SCF analysis finished in %.2f s\n', toc(tEnergy));
+                if isfield(energy, 'total')
+                    fprintf('Total polarization energy: %.10f\n', energy.total);
+                end
+            end
+        else
+            if verbose
+                fprintf('Skipping post-SCF energy/decomposition outputs.\n');
+            end
+            energy = struct();
+            energy_by_molecule = table();
+            dipole_dipole_decomp = struct();
         end
+
     else
         if verbose
             fprintf('Skipping operator assembly and SCF because Eext is empty.\n');
         end
 
-        % optional neutral defaults
+        % Optional neutral defaults
         energy = struct();
         energy.polarization_self = 0;
         energy.external_charge_dipole = 0;
@@ -319,7 +364,7 @@ function result = run_polarization_calc(crystal, model, opts, params)
     result.energy_by_molecule = energy_by_molecule;
     result.dipole_dipole_decomposition = dipole_dipole_decomp;
     result.status = 'energy-reporting stage complete';
-    result.message = 'System built, operator assembled, induced dipoles solved, energy breakdown reported.';
+    result.message = 'System built, operator assembled, induced dipoles solved, requested outputs reported.';
 
     if verbose
         fprintf('=== done ===\n\n');

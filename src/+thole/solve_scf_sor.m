@@ -1,27 +1,18 @@
 function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
-%SOLVE_SCF_SOR Solve (I - A*T) mu = A*Eext by block GS / SOR sweeps.
+%SOLVE_SCF_SOR Solve induced dipoles by block GS / SOR sweeps on T.
 %
-% This implementation is derived directly from the block rows of
-%   M * mu = b,  where  M = I - A*T,  b = A*Eext
+% Uses the fixed-point form
+%   mu_i = alpha_i * (Eext_i + sum_j T_ij mu_j)
 %
-% Vector ordering matches util.stack_xyz / util.unstack_xyz:
-%   [x1; y1; z1; x2; y2; z2; ...]
+% with Gauss-Seidel / SOR ordering:
+%   earlier j use newest values
+%   later   j use previous-iteration values
 %
-% omega = 1.0   -> Gauss-Seidel
+% omega = 1.0 -> GS
 % 0 < omega < 1 -> under-relaxed GS
 % 1 < omega < 2 -> SOR
 
     nSites = sys.n_sites;
-
-    verbose = false;
-    if isfield(scfParams, 'verbose') && ~isempty(scfParams.verbose)
-        verbose = logical(scfParams.verbose);
-    end
-
-    printEvery = 10;
-    if isfield(scfParams, 'printEvery') && ~isempty(scfParams.printEvery)
-        printEvery = scfParams.printEvery;
-    end
 
     if ~isequal(size(Eext), [nSites, 3])
         error('Eext must be N x 3.');
@@ -30,125 +21,186 @@ function [mu, scf] = solve_scf_sor(sys, Eext, T, scfParams)
         error('T must be 3N x 3N.');
     end
 
+    % ---------------------------
+    % Parse options
+    % ---------------------------
     tol = 1e-8;
-    if isfield(scfParams, 'tol') && ~isempty(scfParams.tol)
+    if isfield(scfParams,'tol') && ~isempty(scfParams.tol)
         tol = scfParams.tol;
     end
 
     maxIter = 1000;
-    if isfield(scfParams, 'maxIter') && ~isempty(scfParams.maxIter)
+    if isfield(scfParams,'maxIter') && ~isempty(scfParams.maxIter)
         maxIter = scfParams.maxIter;
     end
 
     omega = 1.0;
-    if isfield(scfParams, 'omega') && ~isempty(scfParams.omega)
+    if isfield(scfParams,'omega') && ~isempty(scfParams.omega)
         omega = scfParams.omega;
     end
-
     if omega <= 0 || omega >= 2
         error('scfParams.omega must satisfy 0 < omega < 2.');
     end
 
-    % Build the exact same linear system used by the direct solver:
-    %   M = I - A*T
-    %   b = A*Eext_vec
-    A = thole.build_alpha_matrix(sys);
-    Eext_vec = util.stack_xyz(Eext);
-    M = eye(3*nSites) - A*T;
-    b = A * Eext_vec;
-
-    if isfield(scfParams, 'initial_mu') && ~isempty(scfParams.initial_mu)
-        mu0 = scfParams.initial_mu;
-        if ~isequal(size(mu0), [nSites, 3])
-            error('scfParams.initial_mu must be N x 3.');
-        end
-        mu_vec = util.stack_xyz(mu0);
-    else
-        mu_vec = zeros(3*nSites, 1);
+    verbose = false;
+    if isfield(scfParams,'verbose') && ~isempty(scfParams.verbose)
+        verbose = logical(scfParams.verbose);
     end
 
+    printEvery = 10;
+    if isfield(scfParams,'printEvery') && ~isempty(scfParams.printEvery)
+        printEvery = scfParams.printEvery;
+    end
+
+    residualEvery = 25;
+    if isfield(scfParams,'residualEvery') && ~isempty(scfParams.residualEvery)
+        residualEvery = scfParams.residualEvery;
+    end
+
+    polMask = logical(sys.site_is_polarizable(:));
+    alpha   = sys.site_alpha(:);
+
+    if numel(polMask) ~= nSites || numel(alpha) ~= nSites
+        error('sys.site_is_polarizable and sys.site_alpha must both have length nSites.');
+    end
+
+    if isfield(scfParams,'initial_mu') && ~isempty(scfParams.initial_mu)
+        mu = scfParams.initial_mu;
+        if ~isequal(size(mu), [nSites, 3])
+            error('scfParams.initial_mu must be N x 3.');
+        end
+    else
+        mu = zeros(nSites, 3);
+    end
+
+    activeIdx = find(polMask);
+    nActive = numel(activeIdx);
+
+    % Precompute block indices once.
+    blkStart = 3*activeIdx - 2;
+    blkMid   = 3*activeIdx - 1;
+    blkEnd   = 3*activeIdx;
+    blocks   = [blkStart, blkMid, blkEnd];
+
+    % Precompute right-hand normalization vector b = A*Eext for residuals.
+    % Only used for occasional diagnostics.
+    b = zeros(3*nSites, 1);
+    for k = 1:nActive
+        i = activeIdx(k);
+        Ii = blocks(k,1):blocks(k,3);
+        b(Ii) = alpha(i) * Eext(i,:).';
+    end
     bn = norm(b);
     if bn == 0
         bn = 1.0;
     end
 
-    history = zeros(maxIter, 1);
+    history = zeros(maxIter,1);
+    relresHistory = nan(maxIter,1);
     converged = false;
 
-    % Precompute 3x3 block indices.
-    activeIdx = find(logical(sys.site_is_polarizable(:)));
-    blocks = cell(numel(activeIdx), 1);
-    for k = 1:numel(activeIdx)
-        i = activeIdx(k);
-        blocks{k} = (3*i-2):(3*i);
+    if verbose
+        if abs(omega - 1.0) < 1e-14
+            solverName = 'GS';
+        else
+            solverName = 'SOR';
+        end
+        fprintf('SCF(%s): tol=%.3e, maxIter=%d, omega=%.3f\n', ...
+            solverName, tol, maxIter, omega);
     end
 
     for iter = 1:maxIter
-        mu_old = mu_vec;
+        mu_old = mu;
 
-        % Block GS / SOR sweep:
-        % M_ii * mu_i^(GS) =
-        %   b_i
-        %   - sum_{j<i} M_ij * mu_j^(new)
-        %   - sum_{j>i} M_ij * mu_j^(old)
-        for k = 1:numel(activeIdx)
-            Ii = blocks{k};
+        for k = 1:nActive
+            i = activeIdx(k);
+            Ii = blocks(k,1):blocks(k,3);
 
-            rhs_i = b(Ii);
+            % Start from external field at site i
+            E_loc = Eext(i,:).';
 
-            % Earlier blocks: use newest values from mu_vec
+            % Earlier active sites: use newest mu
             for j = 1:(k-1)
-                Ij = blocks{j};
-                rhs_i = rhs_i - M(Ii, Ij) * mu_vec(Ij);
+                jj = activeIdx(j);
+                Jj = blocks(j,1):blocks(j,3);
+                E_loc = E_loc + T(Ii, Jj) * mu(jj,:).';
             end
 
-            % Later blocks: use old values from mu_old
-            for j = (k+1):numel(activeIdx)
-                Ij = blocks{j};
-                rhs_i = rhs_i - M(Ii, Ij) * mu_old(Ij);
+            % Later active sites: use previous-iteration mu
+            for j = (k+1):nActive
+                jj = activeIdx(j);
+                Jj = blocks(j,1):blocks(j,3);
+                E_loc = E_loc + T(Ii, Jj) * mu_old(jj,:).';
             end
 
-            mu_gs_i = M(Ii, Ii) \ rhs_i;
-            mu_vec(Ii) = (1 - omega) * mu_old(Ii) + omega * mu_gs_i;
+            mu_gs_i = alpha(i) * E_loc;
+            mu(i,:) = ((1 - omega) * mu_old(i,:).' + omega * mu_gs_i).';
         end
 
-        r = b - M * mu_vec;
-        relres = norm(r) / bn;
-        history(iter) = relres;
+        dmu = mu - mu_old;
+        err = max(sqrt(sum(dmu.^2, 2)));
+        history(iter) = err;
 
-        if verbose && (iter == 1 || mod(iter, printEvery) == 0 || relres < tol)
-            fprintf('  iter %4d | relres = %.3e\n', iter, relres);
+        doResidual = (iter == 1) || (mod(iter, residualEvery) == 0) || (err < tol);
+        if doResidual
+            relres = local_relres_from_T(mu, T, alpha, polMask, Eext, b, bn);
+            relresHistory(iter) = relres;
+        else
+            relres = NaN;
         end
 
-        if relres < tol
+        if verbose && (iter == 1 || mod(iter, printEvery) == 0 || err < tol)
+            if isnan(relres)
+                fprintf(' iter %4d | max|dmu| = %.3e\n', iter, err);
+            else
+                fprintf(' iter %4d | max|dmu| = %.3e | relres = %.3e\n', iter, err, relres);
+            end
+        end
+
+        if err < tol
             converged = true;
             history = history(1:iter);
+            relresHistory = relresHistory(1:iter);
             break;
-        end
-    end
-
-    if verbose
-        if converged
-            fprintf('SCF(SOR) converged in %d iterations | relres = %.3e\n', ...
-                numel(history), history(end));
-        else
-            fprintf('SCF(SOR) hit maxIter=%d | final relres = %.3e\n', ...
-                maxIter, history(end));
         end
     end
 
     if ~converged
         history = history(1:maxIter);
+        relresHistory = relresHistory(1:maxIter);
     end
-
-    mu = util.unstack_xyz(mu_vec);
 
     scf = struct();
     scf.method = 'sor';
     scf.omega = omega;
     scf.converged = converged;
     scf.nIter = numel(history);
-    scf.relres = history(end);
     scf.history = history;
+    scf.relres_history = relresHistory;
+
+    lastRelres = relresHistory(find(~isnan(relresHistory), 1, 'last'));
+    if isempty(lastRelres)
+        lastRelres = NaN;
+    end
+    scf.relres = lastRelres;
     scf.used_matrix_solver = true;
+end
+
+function relres = local_relres_from_T(mu, T, alpha, polMask, Eext, b, bn)
+% Compute || b - (I - A*T) mu || / ||b|| without building A or M.
+
+    nSites = size(mu,1);
+    mu_vec = util.stack_xyz(mu);
+    Tmu = T * mu_vec;
+
+    r = b - mu_vec;
+
+    activeIdx = find(polMask);
+    for k = 1:numel(activeIdx)
+        i = activeIdx(k);
+        Ii = (3*i-2):(3*i);
+        r(Ii) = r(Ii) + alpha(i) * Tmu(Ii);
+    end
+
+    relres = norm(r) / bn;
 end

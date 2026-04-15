@@ -1,56 +1,31 @@
 function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
 %SOLVE_SCF_ITERATIVE Solve induced dipoles by fixed-point SCF iteration.
+%
+% Legacy pairwise-field implementation. Kept mainly for validation/debug.
+% For performance, prefer solve_scf_matrix_iterative or solve_scf_sor.
 
-    if ~isfield(sys, 'site_is_polarizable') || isempty(sys.site_is_polarizable)
-        error('sys.site_is_polarizable is missing or empty.');
-    end
-    if ~isfield(sys, 'site_alpha') || isempty(sys.site_alpha)
-        error('sys.site_alpha is missing or empty.');
-    end
+    problem = thole.prepare_scf_problem(sys, Eext, scfParams);
 
-    nSites = sys.n_sites;
-    if ~isequal(size(Eext), [nSites, 3])
-        error('Eext must be N x 3.');
-    end
+    nSites = problem.nSites;
+    polMask = problem.polMask;
+    alpha   = problem.alpha;
 
-    tol = 1e-8;
-    if isfield(scfParams, 'tol'), tol = scfParams.tol; end
+    tol       = problem.tol;
+    maxIter   = problem.maxIter;
+    mixing    = problem.mixing;
+    verbose   = problem.verbose;
+    printEvery = problem.printEvery;
 
-    maxIter = 500;
-    if isfield(scfParams, 'maxIter'), maxIter = scfParams.maxIter; end
-
-    mixing = 0.5;
-    if isfield(scfParams, 'mixing'), mixing = scfParams.mixing; end
+    mu = problem.mu0;
 
     softening = 0.0;
-    if isfield(scfParams, 'softening'), softening = scfParams.softening; end
+    if isfield(scfParams, 'softening') && ~isempty(scfParams.softening)
+        softening = scfParams.softening;
+    end
 
     use_thole = true;
-    if isfield(scfParams, 'use_thole'), use_thole = scfParams.use_thole; end
-
-    verbose = false;
-    if isfield(scfParams, 'verbose') && ~isempty(scfParams.verbose)
-        verbose = logical(scfParams.verbose);
-    end
-
-    printEvery = 10;
-    if isfield(scfParams, 'printEvery') && ~isempty(scfParams.printEvery)
-        printEvery = scfParams.printEvery;
-    end
-
-    if isfield(scfParams, 'initial_mu') && ~isempty(scfParams.initial_mu)
-        mu = scfParams.initial_mu;
-        if ~isequal(size(mu), [nSites, 3])
-            error('scfParams.initial_mu must be N x 3.');
-        end
-    else
-        mu = zeros(nSites, 3);
-    end
-
-    polMask = logical(sys.site_is_polarizable(:));
-    alpha = sys.site_alpha(:);
-    if numel(alpha) ~= nSites
-        error('sys.site_alpha must have length N.');
+    if isfield(scfParams, 'use_thole') && ~isempty(scfParams.use_thole)
+        use_thole = logical(scfParams.use_thole);
     end
 
     history = zeros(maxIter, 1);
@@ -68,6 +43,7 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
     end
 
     tSCF = tic;
+
     for iter = 1:maxIter
         if use_thole
             Edip = thole.induced_field_from_dipoles_thole(sys, mu, dipoleParams);
@@ -88,12 +64,13 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
         mu = mu_mixed;
 
         if verbose && (iter == 1 || mod(iter, printEvery) == 0 || err < tol)
-            fprintf('  iter %4d | max|dmu| = %.3e\n', iter, err);
+            fprintf(' iter %4d | max|dmu| = %.3e\n', iter, err);
         end
 
         if err < tol
             converged = true;
             history = history(1:iter);
+
             if verbose
                 fprintf('SCF(iterative) converged in %d iterations (%.2f s)\n', ...
                     iter, toc(tSCF));
@@ -111,6 +88,7 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
     end
 
     scf = struct();
+    scf.method = 'iterative';
     scf.converged = converged;
     scf.nIter = numel(history);
     scf.history = history;
