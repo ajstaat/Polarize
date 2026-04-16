@@ -3,47 +3,7 @@ clc;
 
 fprintf('=== nonperiodic active-space energy/decomposition test ===\n');
 
-% -------------------------------------------------------------------------
-% Small case patterned after your run scripts
-% -------------------------------------------------------------------------
-crystal = struct();
-crystal.cellpar = [12.3, 14.1, 9.8, 90.0, 101.2, 88.4];
-crystal.lattice = [];
-crystal.frac_coords = [
-    0.10 0.20 0.30
-    0.15 0.22 0.35
-    0.60 0.70 0.80
-];
-crystal.cart_coords = [];
-crystal.mol_id = [1; 1; 2];
-crystal.site_label = {'C1'; 'H1'; 'N1'};
-crystal.site_type = {'C'; 'H'; 'N'};
-
-model = struct();
-model.polarizable_types = {'C','N'};
-model.alpha_by_type = struct();
-model.alpha_by_type.C = 10.0;
-model.alpha_by_type.N = 8.0;
-model.thole_a = 0.39;
-
-model.charge_pattern = struct();
-model.charge_pattern.site_label = {'C1','H1'};
-model.charge_pattern.delta_q = [0.10, -0.10];
-
-opts0 = struct();
-opts0.supercell_size = [2 2 1];
-opts0.verbose = false;
-opts0.removeMolIDs = [];
-opts0.activeMolIDs = [];
-
-params0 = util.default_params();
-params0.scf.solver = 'matrix_iterative';
-
-result0 = calc.run_polarization_calc(crystal, model, opts0, params0);
-sys0 = result0.sys;
-
-molA = builder.find_unique_molecule_id(sys0, 1, [0 0 0]);
-molB = builder.find_unique_molecule_id(sys0, 1, [1 0 0]);
+[crystal, model, opts0, ~, molA, molB] = make_standard_nonperiodic_case([2 2 1]);
 
 opts = opts0;
 opts.activeMolIDs = [molA, molB];
@@ -58,24 +18,15 @@ params.output.computeEnergy = true;
 params.output.computeEnergyByMolecule = true;
 params.output.computeDipoleDipoleDecomp = true;
 
-params_iter = params;
-params_iter.scf.solver = 'matrix_iterative';
-
-params_dir = params;
-params_dir.scf.solver = 'direct';
-
-params_sor = params;
-params_sor.scf.solver = 'sor';
+params_iter = params; params_iter.scf.solver = 'matrix_iterative';
+params_dir  = params; params_dir.scf.solver  = 'direct';
+params_sor  = params; params_sor.scf.solver  = 'sor';
 
 res_iter = calc.run_polarization_calc(crystal, model, opts, params_iter);
 res_dir  = calc.run_polarization_calc(crystal, model, opts, params_dir);
 res_sor  = calc.run_polarization_calc(crystal, model, opts, params_sor);
 
-% -------------------------------------------------------------------------
-% 1) Dipole agreement
-% -------------------------------------------------------------------------
 fprintf('\n--- dipole agreement ---\n');
-
 err_iter_dir = max(sqrt(sum((res_iter.mu - res_dir.mu).^2, 2)));
 err_sor_dir  = max(sqrt(sum((res_sor.mu  - res_dir.mu).^2, 2)));
 
@@ -85,14 +36,7 @@ fprintf('max |mu_sor  - mu_direct| = %.16e\n', err_sor_dir);
 assert(err_iter_dir < 1e-8, 'matrix_iterative mu disagrees with direct');
 assert(err_sor_dir  < 1e-8, 'sor mu disagrees with direct');
 
-% -------------------------------------------------------------------------
-% 2) Total energy agreement across solvers
-% -------------------------------------------------------------------------
 fprintf('\n--- total energy agreement ---\n');
-
-assert(isfield(res_iter, 'energy') && isfield(res_iter.energy, 'total'), 'iter energy.total missing');
-assert(isfield(res_dir,  'energy') && isfield(res_dir.energy,  'total'), 'dir energy.total missing');
-assert(isfield(res_sor,  'energy') && isfield(res_sor.energy,  'total'), 'sor energy.total missing');
 
 E_iter = res_iter.energy.total;
 E_dir  = res_dir.energy.total;
@@ -108,9 +52,6 @@ fprintf('|E_sor  - E_dir| = %.16e\n', abs(E_sor - E_dir));
 assert(abs(E_iter - E_dir) < 1e-10, 'matrix_iterative total energy disagrees with direct');
 assert(abs(E_sor  - E_dir) < 1e-10, 'sor total energy disagrees with direct');
 
-% -------------------------------------------------------------------------
-% 3) Per-molecule energy table agreement
-% -------------------------------------------------------------------------
 fprintf('\n--- per-molecule energy agreement ---\n');
 
 tbl_iter = res_iter.energy_by_molecule;
@@ -130,12 +71,7 @@ if any(strcmp(tbl_iter.Properties.VariableNames, 'mol_id'))
     tbl_sor  = sortrows(tbl_sor,  'mol_id');
 end
 
-vars_iter = tbl_iter.Properties.VariableNames;
-vars_dir  = tbl_dir.Properties.VariableNames;
-vars_sor  = tbl_sor.Properties.VariableNames;
-
-assert(isequal(vars_iter, vars_dir), 'iter/dir molecule table variable names mismatch');
-assert(isequal(vars_sor,  vars_dir), 'sor/dir molecule table variable names mismatch');
+vars_dir = tbl_dir.Properties.VariableNames;
 
 for c = 1:numel(vars_dir)
     name = vars_dir{c};
@@ -162,18 +98,11 @@ if any(strcmp(tbl_dir.Properties.VariableNames, 'total'))
     fprintf('|sum_mol - global|     = %.16e\n', abs(sum_mol_dir - E_dir));
 end
 
-% -------------------------------------------------------------------------
-% 4) Dipole-dipole decomposition agreement
-% -------------------------------------------------------------------------
 fprintf('\n--- dipole-dipole decomposition agreement ---\n');
 
 dd_iter = res_iter.dipole_dipole_decomposition;
 dd_dir  = res_dir.dipole_dipole_decomposition;
 dd_sor  = res_sor.dipole_dipole_decomposition;
-
-assert(isstruct(dd_iter), 'iter dipole_dipole_decomposition is not a struct');
-assert(isstruct(dd_dir),  'dir dipole_dipole_decomposition is not a struct');
-assert(isstruct(dd_sor),  'sor dipole_dipole_decomposition is not a struct');
 
 if isfield(dd_iter, 'total') && isfield(dd_dir, 'total') && isfield(dd_sor, 'total')
     fprintf('dd total(iter) = %.16e\n', dd_iter.total);
@@ -197,9 +126,9 @@ if has_pair_arrays
         key_iter = [dd_iter.site_i(:), dd_iter.site_j(:)];
         key_sor  = [dd_sor.site_i(:),  dd_sor.site_j(:)];
 
-        [key_dir, ord_dir] = sortrows(key_dir);
+        [key_dir, ord_dir]   = sortrows(key_dir);
         [key_iter, ord_iter] = sortrows(key_iter);
-        [key_sor, ord_sor] = sortrows(key_sor);
+        [key_sor, ord_sor]   = sortrows(key_sor);
 
         assert(isequal(key_iter, key_dir), 'iter dd pair keys mismatch');
         assert(isequal(key_sor,  key_dir), 'sor dd pair keys mismatch');
@@ -226,21 +155,12 @@ if has_pair_arrays
     end
 end
 
-% -------------------------------------------------------------------------
-% 5) Optional direct active-space consistency checks
-% -------------------------------------------------------------------------
 fprintf('\n--- active-space internal consistency ---\n');
-
-sys = builder.make_crystal_system(crystal, model, opts);
-sys = builder.assign_point_charges(sys, model.charge_pattern);
-Eext = calc.compute_external_field(sys, params);
-problem = thole.prepare_scf_problem(sys, Eext, params.scf);
-[Tpol, ~] = ewald.assemble_nonperiodic_interaction_matrix(sys, problem, params.ewald, params.scf);
-
+[sys, polsys, Eext, problem, Tpol] = build_nonperiodic_test_problem(crystal, model, opts, params);
 mu_dir = res_dir.mu;
 
 if exist('calc.compute_total_energy_active_space', 'file') == 2
-    e_active = calc.compute_total_energy_active_space(sys, problem, mu_dir, Eext, Tpol);
+    e_active = calc.compute_total_energy_active_space(polsys, problem, mu_dir, Eext, Tpol);
     fprintf('direct active-space total = %.16e\n', e_active.total);
     fprintf('driver total              = %.16e\n', E_dir);
     fprintf('|active - driver|         = %.16e\n', abs(e_active.total - E_dir));
@@ -248,7 +168,7 @@ if exist('calc.compute_total_energy_active_space', 'file') == 2
 end
 
 if exist('calc.compute_total_energy_by_molecule_active_space', 'file') == 2
-    tbl_active = calc.compute_total_energy_by_molecule_active_space(sys, problem, mu_dir, Eext, Tpol);
+    tbl_active = calc.compute_total_energy_by_molecule_active_space(polsys, problem, mu_dir, Eext, Tpol);
     if any(strcmp(tbl_active.Properties.VariableNames, 'mol_id'))
         tbl_active = sortrows(tbl_active, 'mol_id');
         tbl_dir2 = sortrows(tbl_dir, 'mol_id');

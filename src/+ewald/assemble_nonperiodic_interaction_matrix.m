@@ -26,6 +26,8 @@ function [Tpol, opinfo] = assemble_nonperiodic_interaction_matrix(sys, problem, 
 %   - Self blocks are zero.
 %   - Matrix is assembled in polarizable-site space only.
 
+io.assert_atomic_units(sys);
+
     if nargin < 3
         ewaldParams = struct(); %#ok<NASGU>
     end

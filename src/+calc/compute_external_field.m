@@ -1,6 +1,8 @@
 function Eext = compute_external_field(sys, params)
 %COMPUTE_EXTERNAL_FIELD External field at working sites from assigned charges.
 
+io.assert_atomic_units(sys);
+
 fieldParams = struct();
 
 if isfield(params, 'field') && ~isempty(params.field)
