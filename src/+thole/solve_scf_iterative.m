@@ -3,11 +3,7 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
 %
 % This solver does NOT assemble the explicit dipole interaction matrix.
 % Instead, each iteration applies the dipole-field operator through
-% induced_field_from_dipoles_thole(...) or induced_field_from_dipoles(...).
-%
-% Intended role
-%   - matrix-free iterative solver for larger systems
-%   - useful when explicit dense Tpol assembly is too costly in memory
+% thole.induced_field_from_dipoles_thole(...).
 %
 % Inputs
 %   sys        canonical polarization-system struct in atomic units
@@ -23,7 +19,7 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
 %   .residualEvery
 %   .stopMetric        'max_dmu' | 'relres'
 %   .softening
-%   .use_thole
+%   .rcut
 %
 % Output
 %   mu         N x 3 induced dipoles
@@ -60,11 +56,6 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
         softening = scfParams.softening;
     end
 
-    use_thole = true;
-    if isfield(scfParams, 'use_thole') && ~isempty(scfParams.use_thole)
-        use_thole = logical(scfParams.use_thole);
-    end
-
     history = zeros(maxIter, 1);
     relresHistory = nan(maxIter, 1);
     converged = false;
@@ -79,19 +70,27 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
         dipoleParams.rcut = scfParams.rcut;
     end
 
+    % Build and attach bare-geometry cache once for repeated matrix-free applies.
+    cacheOpts = struct();
+    cacheOpts.site_mask = polMask;
+
+    if isfield(dipoleParams, 'rcut') && ~isempty(dipoleParams.rcut)
+        cacheOpts.rcut = dipoleParams.rcut;
+    else
+        cacheOpts.rcut = inf;
+    end
+
+    dipoleParams.geom_cache = geom.build_nonperiodic_pair_cache(sys, cacheOpts);
+
     if verbose
-        fprintf('SCF(iterative, matrix-free): tol=%.3e, maxIter=%d, mixing=%.3f, use_thole=%d\n', ...
-            tol, maxIter, mixing, use_thole);
+        fprintf('SCF(iterative, matrix-free): tol=%.3e, maxIter=%d, mixing=%.3f\n', ...
+            tol, maxIter, mixing);
     end
 
     tSCF = tic;
 
     for iter = 1:maxIter
-        if use_thole
-            Edip = thole.induced_field_from_dipoles_thole(sys, mu, dipoleParams);
-        else
-            Edip = thole.induced_field_from_dipoles(sys, mu, dipoleParams);
-        end
+        Edip = thole.induced_field_from_dipoles_thole(sys, mu, dipoleParams);
 
         Etot = Eext + Edip;
 
@@ -105,11 +104,13 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
         history(iter) = err;
         mu = mu_mixed;
 
+        % Only compute residual on its own cadence, unless relres is the stopping metric.
         doResidual = strcmp(stopMetric, "relres") || ...
-                     (iter == 1) || (mod(iter, residualEvery) == 0) || (err < tol);
+                     (iter == 1) || ...
+                     (mod(iter, residualEvery) == 0);
 
         if doResidual
-            relres = local_matrix_free_relres(sys, problem, mu, Eext, use_thole, softening);
+            relres = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams);
             relresHistory(iter) = relres;
         else
             relres = NaN;
@@ -135,6 +136,16 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
         end
 
         if converged
+            % For max_dmu stopping, compute one final residual if needed so scf.relres is meaningful.
+            if ~strcmp(stopMetric, "relres") && isnan(relres)
+                relres = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams);
+                relresHistory(iter) = relres;
+
+                if verbose
+                    fprintf(' final relres = %.3e\n', relres);
+                end
+            end
+
             history = history(1:iter);
             relresHistory = relresHistory(1:iter);
 
@@ -149,6 +160,11 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
     if ~converged
         history = history(1:maxIter);
         relresHistory = relresHistory(1:maxIter);
+
+        % One final residual evaluation if none was taken on the last iteration.
+        if isnan(relresHistory(end))
+            relresHistory(end) = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams);
+        end
 
         if verbose
             fprintf(['SCF(iterative, matrix-free) hit maxIter=%d after %.2f s ' ...
@@ -170,12 +186,11 @@ function [mu, scf] = solve_scf_iterative(sys, Eext, scfParams)
         lastRelres = NaN;
     end
     scf.relres = lastRelres;
-    scf.used_thole = use_thole;
+    scf.used_thole = true;
     scf.used_matrix_solver = false;
 end
 
-
-function relres = local_matrix_free_relres(sys, problem, mu, Eext, use_thole, softening)
+function relres = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams)
 % Relative residual for the matrix-free fixed-point equation
 %   mu = A * (Eext + Edip(mu))
 % on the polarizable sites only.
@@ -183,17 +198,7 @@ function relres = local_matrix_free_relres(sys, problem, mu, Eext, use_thole, so
     polMask = problem.polMask;
     alpha   = problem.alpha;
 
-    dipoleParams = struct();
-    dipoleParams.exclude_self = true;
-    dipoleParams.softening = softening;
-    dipoleParams.target_mask = polMask;
-    dipoleParams.source_mask = polMask;
-
-    if use_thole
-        Edip = thole.induced_field_from_dipoles_thole(sys, mu, dipoleParams);
-    else
-        Edip = thole.induced_field_from_dipoles(sys, mu, dipoleParams);
-    end
+    Edip = thole.induced_field_from_dipoles_thole(sys, mu, dipoleParams);
 
     rhs = zeros(problem.nSites, 3);
     rhs(polMask, :) = alpha(polMask) .* (Eext(polMask, :) + Edip(polMask, :));

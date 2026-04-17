@@ -1,30 +1,34 @@
 function pairs = query_pairs_within_cutoff(spatial, cutoff, opts)
 %QUERY_PAIRS_WITHIN_CUTOFF Find unordered pairs within a distance cutoff.
 %
+% pairs = geom.query_pairs_within_cutoff(spatial, cutoff)
 % pairs = geom.query_pairs_within_cutoff(spatial, cutoff, opts)
 %
 % Inputs
-%   spatial : struct from geom.build_spatial_index
-%   cutoff  : scalar cutoff distance
+%   spatial : struct from geom.build_spatial_index(...)
+%   cutoff  : positive scalar cutoff distance
 %   opts    : optional struct with fields
-%       .return_r      logical, default true
-%       .return_dr     logical, default true
-%       .subset_idx    vector of indices into spatial.pos, default []
-%                      If provided, only those points are queried.
+%       .subset_idx         vector of point indices into spatial.pos
+%                           default = all points
+%       .return_r           logical, default true
+%       .return_dr          logical, default true
+%       .return_full_idx    logical, default false
 %
 % Output
 %   pairs : struct with fields
-%       .i   npairs x 1 indices into subset space if subset_idx given,
-%            otherwise indices into spatial.pos
-%       .j   npairs x 1
-%       .dr  npairs x 3 displacement vectors (j - i), if requested
-%       .r2  npairs x 1 squared distances
-%       .r   npairs x 1 distances, if requested
+%       .i, .j          unordered pair indices
+%       .r2             squared distances
+%       .dr             displacement vectors, if requested
+%       .r              distances, if requested
+%       .index_space    'subset' or 'full'
+%       .subset_idx     subset mapping used for the query
 %
 % Notes
-%   - This first draft uses brute-force enumeration with i < j.
+%   - If subset_idx is supplied and return_full_idx = false, i and j are in
+%     subset-local indexing (1:numel(subset_idx)).
+%   - If subset_idx is supplied and return_full_idx = true, i and j are in
+%     full indexing into spatial.pos.
 %   - For periodic geometry, minimum-image displacement is used.
-%   - The subset_idx option is useful for active-site-only queries.
 
     narginchk(2, 3);
 
@@ -32,29 +36,29 @@ function pairs = query_pairs_within_cutoff(spatial, cutoff, opts)
         opts = struct();
     end
 
-    validateattributes(cutoff, {'double'}, {'scalar', 'real', 'finite', 'positive'}, ...
+    validateattributes(cutoff, {'double'}, {'scalar', 'positive', 'finite', 'real'}, ...
         mfilename, 'cutoff', 2);
 
-    return_r  = get_opt(opts, 'return_r', true);
-    return_dr = get_opt(opts, 'return_dr', true);
-    subsetIdx = get_opt(opts, 'subset_idx', []);
+    subsetIdx     = local_get_opt(opts, 'subset_idx', []);
+    returnR       = local_get_opt(opts, 'return_r', true);
+    returnDr      = local_get_opt(opts, 'return_dr', true);
+    returnFullIdx = local_get_opt(opts, 'return_full_idx', false);
 
     if isempty(subsetIdx)
         idxMap = (1:spatial.n).';
     else
         validateattributes(subsetIdx, {'numeric'}, {'vector', 'integer', 'positive'}, ...
             mfilename, 'opts.subset_idx');
-        subsetIdx = subsetIdx(:);
-        if any(subsetIdx > spatial.n)
+        idxMap = subsetIdx(:);
+        if any(idxMap > spatial.n)
             error('geom:query_pairs_within_cutoff:SubsetOutOfRange', ...
                 'opts.subset_idx contains indices outside spatial.pos.');
         end
-        idxMap = subsetIdx;
     end
 
     pos = spatial.pos(idxMap, :);
     n = size(pos, 1);
-    cutoff2 = cutoff * cutoff;
+    cutoff2 = cutoff^2;
 
     maxPairs = n * (n - 1) / 2;
 
@@ -62,7 +66,7 @@ function pairs = query_pairs_within_cutoff(spatial, cutoff, opts)
     pairJ = zeros(maxPairs, 1);
     r2All = zeros(maxPairs, 1);
 
-    if return_dr
+    if returnDr
         drAll = zeros(maxPairs, 3);
     else
         drAll = zeros(0, 3);
@@ -72,13 +76,13 @@ function pairs = query_pairs_within_cutoff(spatial, cutoff, opts)
 
     switch spatial.method
         case 'bruteforce'
-            for i = 1:n-1
+            for i = 1:(n-1)
                 ri = pos(i, :);
-                for j = i+1:n
+                for j = (i+1):n
                     dr = pos(j, :) - ri;
 
                     if spatial.isPeriodic
-                        dr = minimum_image_displacement(dr, spatial.cell, spatial.invCell);
+                        dr = local_minimum_image(dr, spatial.cell, spatial.invCell);
                     end
 
                     r2 = dot(dr, dr);
@@ -87,7 +91,7 @@ function pairs = query_pairs_within_cutoff(spatial, cutoff, opts)
                         pairI(nPairs) = i;
                         pairJ(nPairs) = j;
                         r2All(nPairs) = r2;
-                        if return_dr
+                        if returnDr
                             drAll(nPairs, :) = dr;
                         end
                     end
@@ -102,8 +106,16 @@ function pairs = query_pairs_within_cutoff(spatial, cutoff, opts)
     pairI = pairI(1:nPairs);
     pairJ = pairJ(1:nPairs);
     r2All = r2All(1:nPairs);
-    if return_dr
+    if returnDr
         drAll = drAll(1:nPairs, :);
+    end
+
+    if returnFullIdx
+        pairI = idxMap(pairI);
+        pairJ = idxMap(pairJ);
+        indexSpace = 'full';
+    else
+        indexSpace = 'subset';
     end
 
     pairs = struct();
@@ -111,26 +123,26 @@ function pairs = query_pairs_within_cutoff(spatial, cutoff, opts)
     pairs.j = pairJ;
     pairs.r2 = r2All;
 
-    if return_dr
+    if returnDr
         pairs.dr = drAll;
     end
-    if return_r
+    if returnR
         pairs.r = sqrt(r2All);
     end
 
-    pairs.index_space = 'subset';
+    pairs.index_space = indexSpace;
     pairs.subset_idx = idxMap;
 end
 
-function dr = minimum_image_displacement(dr, cellMat, invCell)
-%MINIMUM_IMAGE_DISPLACEMENT Apply minimum-image convention in a general cell.
+function dr = local_minimum_image(dr, cellMat, invCell)
+%LOCAL_MINIMUM_IMAGE Apply minimum-image convention in a general cell.
 
     frac = (invCell * dr(:)).';
     frac = frac - round(frac);
     dr = (cellMat * frac(:)).';
 end
 
-function value = get_opt(s, name, defaultValue)
+function value = local_get_opt(s, name, defaultValue)
     if isfield(s, name) && ~isempty(s.(name))
         value = s.(name);
     else

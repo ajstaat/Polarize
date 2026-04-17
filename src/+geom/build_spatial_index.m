@@ -1,22 +1,23 @@
 function spatial = build_spatial_index(pos, opts)
 %BUILD_SPATIAL_INDEX Construct reusable geometric search object.
 %
+% spatial = geom.build_spatial_index(pos)
 % spatial = geom.build_spatial_index(pos, opts)
 %
 % Inputs
 %   pos   : N x 3 Cartesian coordinates
 %   opts  : optional struct with fields
 %       .isPeriodic   logical, default false
-%       .cell         3x3 cell matrix or [], default []
-%       .method       'bruteforce' for now, default 'bruteforce'
+%       .cell         3 x 3 lattice matrix, required if isPeriodic = true
+%       .method       currently only 'bruteforce', default 'bruteforce'
 %
 % Output
-%   spatial : struct suitable for geom.query_pairs_within_cutoff
+%   spatial : struct suitable for geom.query_pairs_within_cutoff(...)
 %
 % Notes
-%   - This first draft defines the interface and stores geometry.
-%   - The current backend is brute force.
-%   - A future cell-list implementation can preserve this interface.
+%   - This first version keeps the interface stable and uses a brute-force
+%     backend.
+%   - A future cell-list backend can preserve the same API.
 
     narginchk(1, 2);
 
@@ -27,9 +28,9 @@ function spatial = build_spatial_index(pos, opts)
     validateattributes(pos, {'double'}, {'2d', 'ncols', 3, 'finite', 'real'}, ...
         mfilename, 'pos', 1);
 
-    isPeriodic = get_opt(opts, 'isPeriodic', false);
-    cellMat    = get_opt(opts, 'cell', []);
-    method     = get_opt(opts, 'method', 'bruteforce');
+    isPeriodic = local_get_opt(opts, 'isPeriodic', false);
+    cellMat    = local_get_opt(opts, 'cell', []);
+    method     = local_get_opt(opts, 'method', 'bruteforce');
 
     if isPeriodic
         if isempty(cellMat)
@@ -45,8 +46,13 @@ function spatial = build_spatial_index(pos, opts)
         end
     end
 
-    validMethods = {'bruteforce'};
-    if ~any(strcmp(method, validMethods))
+    if ~ischar(method) && ~isstring(method)
+        error('geom:build_spatial_index:BadMethod', ...
+            'opts.method must be a character vector or string scalar.');
+    end
+    method = char(string(method));
+
+    if ~strcmp(method, 'bruteforce')
         error('geom:build_spatial_index:UnsupportedMethod', ...
             'Unsupported method "%s".', method);
     end
@@ -65,7 +71,7 @@ function spatial = build_spatial_index(pos, opts)
     end
 end
 
-function value = get_opt(s, name, defaultValue)
+function value = local_get_opt(s, name, defaultValue)
     if isfield(s, name) && ~isempty(s.(name))
         value = s.(name);
     else
