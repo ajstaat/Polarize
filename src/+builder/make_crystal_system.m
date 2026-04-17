@@ -253,6 +253,12 @@ function sys = make_crystal_system(crystal, model, opts)
     if ~isempty(sys.active_molecules)
         sys = builder.select_active_molecules(sys, sys.active_molecules);
     end
+
+    sys.units = struct();
+    sys.units.length = 'angstrom';
+    sys.units.alpha  = 'angstrom^3';
+    sys.units.charge = 'e';
+
 end
 
 
