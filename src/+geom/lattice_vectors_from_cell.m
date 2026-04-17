@@ -17,46 +17,51 @@ function lattice = lattice_vectors_from_cell(cellpar)
 %   b lies in the xy plane
 %   c has general triclinic orientation
 
-if numel(cellpar) ~= 6
-    error('cellpar must be a 1x6 vector: [a b c alpha beta gamma].');
-end
+    if ~isnumeric(cellpar) || numel(cellpar) ~= 6
+        error('geom:lattice_vectors_from_cell:BadInput', ...
+            'cellpar must be a 1x6 numeric vector: [a b c alpha beta gamma].');
+    end
 
-a = cellpar(1);
-b = cellpar(2);
-c = cellpar(3);
+    cellpar = reshape(cellpar, 1, 6);
 
-alpha = deg2rad(cellpar(4));
-beta  = deg2rad(cellpar(5));
-gamma = deg2rad(cellpar(6));
+    a = cellpar(1);
+    b = cellpar(2);
+    c = cellpar(3);
 
-% Basic checks
-if a <= 0 || b <= 0 || c <= 0
-    error('Cell lengths a, b, c must be positive.');
-end
+    alpha = deg2rad(cellpar(4));
+    beta  = deg2rad(cellpar(5));
+    gamma = deg2rad(cellpar(6));
 
-sinGamma = sin(gamma);
-if abs(sinGamma) < 1e-14
-    error('gamma is too close to 0 or 180 degrees; lattice is singular.');
-end
+    if a <= 0 || b <= 0 || c <= 0
+        error('geom:lattice_vectors_from_cell:BadLengths', ...
+            'Cell lengths a, b, c must be positive.');
+    end
 
-% Standard triclinic construction
-avec = [a, 0, 0];
+    sinGamma = sin(gamma);
+    if abs(sinGamma) < 1e-14
+        error('geom:lattice_vectors_from_cell:SingularGamma', ...
+            'gamma is too close to 0 or 180 degrees; lattice is singular.');
+    end
 
-bvec = [b*cos(gamma), ...
-        b*sin(gamma), ...
+    % Standard triclinic construction
+    avec = [a, 0, 0];
+
+    bvec = [ ...
+        b * cos(gamma), ...
+        b * sin(gamma), ...
         0];
 
-cx = c*cos(beta);
-cy = c*(cos(alpha) - cos(beta)*cos(gamma)) / sinGamma;
+    cx = c * cos(beta);
+    cy = c * (cos(alpha) - cos(beta) * cos(gamma)) / sinGamma;
 
-cz2 = c^2 - cx^2 - cy^2;
-if cz2 < -1e-10
-    error('Cell parameters are inconsistent; computed c_z^2 is negative.');
-end
-cz = sqrt(max(cz2, 0));
+    cz2 = c^2 - cx^2 - cy^2;
+    if cz2 < -1e-10
+        error('geom:lattice_vectors_from_cell:InconsistentCell', ...
+            'Cell parameters are inconsistent; computed c_z^2 is negative.');
+    end
 
-cvec = [cx, cy, cz];
+    cz = sqrt(max(cz2, 0));
+    cvec = [cx, cy, cz];
 
-lattice = [avec; bvec; cvec];
-
+    lattice = [avec; bvec; cvec];
 end

@@ -1,19 +1,16 @@
 function crystal = import_contcar_as_crystal(filename, varargin)
 %IMPORT_CONTCAR_AS_CRYSTAL Read a VASP POSCAR/CONTCAR-style file and
-% return a Polarize-compatible crystal struct.
+% return a crystal template struct for Polarize.
 %
-% Required output fields:
-%   crystal.lattice
-%   crystal.frac_coords
-%   crystal.cart_coords
-%   crystal.mol_id
-%   crystal.site_label
-%   crystal.site_type
+% This function builds the UNIT-CELL CHEMICAL TEMPLATE:
+%   - wrapped unit-cell coordinates
+%   - base molecule IDs found in the unit cell
+%   - local site labels within each base molecule
+%   - site types
+%   - simple graph-based site classes for polarizability typing
 %
-% Optional name-value inputs:
-%   'BondScale'      : scalar, default 1.20
-%   'WrapFractional' : logical, default true
-%   'SortMolecules'  : logical, default false
+% It does NOT define final molecule identities for the working supercell.
+% Those are identified later on the built supercell itself.
 
     p = inputParser;
     addRequired(p, 'filename', @(x) ischar(x) || isstring(x));
@@ -21,7 +18,6 @@ function crystal = import_contcar_as_crystal(filename, varargin)
     addParameter(p, 'WrapFractional', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'SortMolecules', false, @(x) islogical(x) && isscalar(x));
     parse(p, filename, varargin{:});
-
     opts = p.Results;
 
     S = io.read_vasp_structure(filename);
@@ -31,60 +27,71 @@ function crystal = import_contcar_as_crystal(filename, varargin)
         S.cart = S.frac * S.lattice;
     end
 
-    [A, ~] = io.build_vasp_bond_graph(S, opts.BondScale);
-    comp = conncomp(graph(A)).';
+    % Unit-cell PBC bond graph
+    [A_unit, ~] = io.build_pbc_bond_graph(S.species, S.frac, S.lattice, opts.BondScale);
 
-    if opts.SortMolecules
-        comp = relabel_molecules_by_com(S, comp);
+    % Identify molecules in the UNIT CELL for template/provenance purposes
+    molecules = io.unwrap_all_contcar_molecules(S, ...
+        'BondScale', opts.BondScale, ...
+        'SortMolecules', opts.SortMolecules);
+
+    nSites = size(S.frac, 1);
+    base_mol_id = zeros(nSites, 1);
+
+    for k = 1:numel(molecules)
+        idx = molecules{k}.indices(:);
+        base_mol_id(idx) = k;
     end
+
+    if any(base_mol_id == 0)
+        error('io:import_contcar_as_crystal:UnassignedSites', ...
+            'Failed to assign base molecule IDs to all sites.');
+    end
+
+    % New graph-based classes
+    site_class = io.infer_simple_site_classes(S.species, A_unit);
 
     crystal = struct();
     crystal.cellpar     = [];
     crystal.lattice     = S.lattice;
     crystal.frac_coords = S.frac;
     crystal.cart_coords = S.cart;
-    crystal.mol_id      = comp(:);
+
+    crystal.base_mol_id = base_mol_id;
     crystal.site_type   = S.species(:);
-    crystal.site_label  = io.make_molecule_local_site_labels(S.species, comp);
+    crystal.site_class  = site_class(:);
+    crystal.site_label  = io.make_molecule_local_site_labels(S.species, base_mol_id);
 
     validate_crystal_import(crystal);
-end
-
-function mol_id = relabel_molecules_by_com(S, mol_id_in)
-    mols = unique(mol_id_in(:));
-    coms = zeros(numel(mols), 3);
-
-    for k = 1:numel(mols)
-        idx = find(mol_id_in == mols(k));
-        Mol = io.unwrap_vasp_molecule(S, idx);
-        coms(k,:) = mean(Mol.cart, 1);
-    end
-
-    [~, order] = sortrows(coms, [3 2 1]);
-
-    mol_id = zeros(size(mol_id_in));
-    for newID = 1:numel(order)
-        oldID = mols(order(newID));
-        mol_id(mol_id_in == oldID) = newID;
-    end
 end
 
 function validate_crystal_import(crystal)
     n = size(crystal.cart_coords, 1);
 
     if ~isequal(size(crystal.lattice), [3 3])
-        error('crystal.lattice must be 3x3.');
+        error('io:import_contcar_as_crystal:BadLattice', ...
+            'crystal.lattice must be 3x3.');
     end
+
     if size(crystal.frac_coords, 2) ~= 3 || size(crystal.cart_coords, 2) ~= 3
-        error('crystal.frac_coords and crystal.cart_coords must be N x 3.');
+        error('io:import_contcar_as_crystal:BadCoordinateShape', ...
+            'crystal.frac_coords and crystal.cart_coords must be N x 3.');
     end
+
     if size(crystal.frac_coords, 1) ~= n
-        error('frac/cart coordinate count mismatch.');
+        error('io:import_contcar_as_crystal:CoordCountMismatch', ...
+            'frac/cart coordinate count mismatch.');
     end
-    if numel(crystal.mol_id) ~= n
-        error('crystal.mol_id must have one entry per site.');
+
+    if numel(crystal.base_mol_id) ~= n
+        error('io:import_contcar_as_crystal:BadBaseMolIdSize', ...
+            'crystal.base_mol_id must have one entry per site.');
     end
-    if numel(crystal.site_type) ~= n || numel(crystal.site_label) ~= n
-        error('site_type and site_label must have one entry per site.');
+
+    if numel(crystal.site_type) ~= n || ...
+       numel(crystal.site_class) ~= n || ...
+       numel(crystal.site_label) ~= n
+        error('io:import_contcar_as_crystal:BadSiteMetadataSize', ...
+            'site_type, site_class, and site_label must have one entry per site.');
     end
 end

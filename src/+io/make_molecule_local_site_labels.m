@@ -6,7 +6,8 @@ function site_label = make_molecule_local_site_labels(species, mol_id)
     mol_id = mol_id(:);
 
     if numel(species) ~= numel(mol_id)
-        error('species and mol_id must have the same length.');
+        error('io:make_molecule_local_site_labels:SizeMismatch', ...
+            'species and mol_id must have the same length.');
     end
 
     site_label = cell(size(species));
@@ -14,8 +15,7 @@ function site_label = make_molecule_local_site_labels(species, mol_id)
 
     for m = 1:numel(mols)
         idx = find(mol_id == mols(m));
-
-        counts = containers.Map('KeyType','char', 'ValueType','double');
+        counts = containers.Map('KeyType', 'char', 'ValueType', 'double');
 
         for k = 1:numel(idx)
             i = idx(k);

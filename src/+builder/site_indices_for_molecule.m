@@ -8,10 +8,15 @@ function idx = site_indices_for_molecule(sys, uniqueMolID)
 % Output
 %   idx          column vector of site indices
 
-if ~isfield(sys, 'site_mol_id') || isempty(sys.site_mol_id)
-    error('sys.site_mol_id is missing or empty.');
-end
+    if ~isfield(sys, 'site_mol_id') || isempty(sys.site_mol_id)
+        error('builder:site_indices_for_molecule:MissingSiteMolId', ...
+            'sys.site_mol_id is missing or empty.');
+    end
 
-idx = find(sys.site_mol_id == uniqueMolID);
+    if ~isscalar(uniqueMolID)
+        error('builder:site_indices_for_molecule:BadMolId', ...
+            'uniqueMolID must be a scalar.');
+    end
 
+    idx = find(sys.site_mol_id == uniqueMolID);
 end

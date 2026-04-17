@@ -11,40 +11,37 @@ function [unique_mol_id, mol_table] = assign_unique_molecule_ids(base_mol_id, ce
 %   unique_mol_id : N x 1 vector
 %                   unique molecule ID for each site in the supercell
 %
-%   mol_table     : struct with one row per unique molecule:
-%                   .unique_mol_id
-%                   .base_mol_id
-%                   .cell_shift
-%                   .site_indices   (cell array)
+%   mol_table     : scalar struct with vector-valued fields, one entry per
+%                   unique molecule image:
+%                   .unique_mol_id   (nMol x 1)
+%                   .base_mol_id     (nMol x 1)
+%                   .cell_shift      (nMol x 3)
+%                   .site_indices    (nMol x 1 cell)
 
-if size(base_mol_id, 2) ~= 1
     base_mol_id = base_mol_id(:);
-end
+    nSites = numel(base_mol_id);
 
-nSites = numel(base_mol_id);
+    if size(cell_shift, 1) ~= nSites || size(cell_shift, 2) ~= 3
+        error('builder:assign_unique_molecule_ids:BadCellShift', ...
+            'cell_shift must be N x 3 and match base_mol_id.');
+    end
 
-if size(cell_shift, 1) ~= nSites || size(cell_shift, 2) ~= 3
-    error('cell_shift must be N x 3 and match base_mol_id.');
-end
+    % Key per site: [base_mol_id, ix, iy, iz]
+    keys = [base_mol_id, cell_shift];
 
-% Key per site: [base_mol_id, ix, iy, iz]
-keys = [base_mol_id, cell_shift];
+    % Sites with the same key belong to the same molecule image
+    [uniqueKeys, ~, ic] = unique(keys, 'rows', 'stable');
 
-% unique rows tells us which sites belong to the same molecule image
-[uniqueKeys, ~, ic] = unique(keys, 'rows', 'stable');
+    nMol = size(uniqueKeys, 1);
+    unique_mol_id = ic;
 
-nMol = size(uniqueKeys, 1);
-unique_mol_id = ic;
+    mol_table = struct();
+    mol_table.unique_mol_id = (1:nMol).';
+    mol_table.base_mol_id = uniqueKeys(:, 1);
+    mol_table.cell_shift = uniqueKeys(:, 2:4);
+    mol_table.site_indices = cell(nMol, 1);
 
-% Build molecule table
-mol_table = struct();
-mol_table.unique_mol_id = (1:nMol).';
-mol_table.base_mol_id = uniqueKeys(:, 1);
-mol_table.cell_shift = uniqueKeys(:, 2:4);
-mol_table.site_indices = cell(nMol, 1);
-
-for m = 1:nMol
-    mol_table.site_indices{m} = find(ic == m);
-end
-
+    for m = 1:nMol
+        mol_table.site_indices{m} = find(ic == m);
+    end
 end
