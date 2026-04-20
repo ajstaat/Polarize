@@ -14,15 +14,23 @@ function E = induced_field_from_charges(sys, fieldParams)
 %                .source_mask            N x 1 logical, optional
 %                .geom_cache             optional bare-geometry cache from
 %                                        geom.build_nonperiodic_pair_cache
+%                .use_thole_damping      logical, default false
 %
 % Output
 %   E            N x 3 electric field at each target site
 %
 % Notes
-%   Field formula used:
+%   Bare field formula:
 %       E_i = sum_j q_j * r_ij / |r_ij|^3
-%   with optional softening:
+%
+%   If use_thole_damping = true, use damped charge->induced-dipole coupling:
+%       E_i = sum_j q_j * f3_ij * r_ij / |r_ij|^3
+%   where f3_ij is the Thole damping factor computed from
+%   thole.thole_f3f5_factors(r, alpha_i, alpha_j, sys.thole_a).
+%
+%   With optional softening:
 %       |r_ij|^2 -> |r_ij|^2 + softening^2
+%
 %   If rcut is supplied, only source-target pairs with bare separation
 %       |r_ij| <= rcut
 %   are included.
@@ -78,6 +86,33 @@ function E = induced_field_from_charges(sys, fieldParams)
         rcut2 = rcut^2;
     end
 
+    useThole = false;
+    if isfield(fieldParams, 'use_thole_damping') && ~isempty(fieldParams.use_thole_damping)
+        useThole = logical(fieldParams.use_thole_damping);
+    end
+
+    if useThole
+        if ~isfield(sys, 'site_alpha') || isempty(sys.site_alpha)
+            error('calc:induced_field_from_charges:MissingSiteAlpha', ...
+                'sys.site_alpha is required when use_thole_damping = true.');
+        end
+        if ~isfield(sys, 'thole_a') || isempty(sys.thole_a)
+            error('calc:induced_field_from_charges:MissingTholeA', ...
+                'sys.thole_a is required when use_thole_damping = true.');
+        end
+
+        alphaSites = sys.site_alpha(:);
+        if numel(alphaSites) ~= nSites
+            error('calc:induced_field_from_charges:BadSiteAlpha', ...
+                'sys.site_alpha must have length N.');
+        end
+
+        tholeA = sys.thole_a;
+    else
+        alphaSites = [];
+        tholeA = [];
+    end
+
     if isfield(fieldParams, 'target_mask') && ~isempty(fieldParams.target_mask)
         target_mask = logical(fieldParams.target_mask(:));
     elseif isfield(sys, 'target_mask') && ~isempty(sys.target_mask)
@@ -110,14 +145,17 @@ function E = induced_field_from_charges(sys, fieldParams)
     end
 
     if ~isempty(geomCache)
-        E = local_apply_cached(q, geomCache, target_mask, source_mask, exclude_self, softening, rcut);
+        E = local_apply_cached(q, alphaSites, tholeA, useThole, ...
+            geomCache, target_mask, source_mask, exclude_self, softening, rcut);
         return;
     end
 
-    E = local_apply_direct(pos, q, target_mask, source_mask, exclude_self, softening, rcut2);
+    E = local_apply_direct(pos, q, alphaSites, tholeA, useThole, ...
+        target_mask, source_mask, exclude_self, softening, rcut2);
 end
 
-function E = local_apply_cached(q, cache, target_mask, source_mask, exclude_self, softening, rcut)
+function E = local_apply_cached(q, alphaSites, tholeA, useThole, ...
+    cache, target_mask, source_mask, exclude_self, softening, rcut)
 
     nSites = cache.nSites;
     E = zeros(nSites, 3);
@@ -130,13 +168,16 @@ function E = local_apply_cached(q, cache, target_mask, source_mask, exclude_self
     end
 
     if exclude_self && isequal(target_mask, source_mask)
-        E = local_apply_cached_symmetric(E, q, cache, target_mask, softening);
+        E = local_apply_cached_symmetric(E, q, alphaSites, tholeA, useThole, ...
+            cache, target_mask, softening);
     else
-        E = local_apply_cached_masked(E, q, cache, target_mask, source_mask, softening, exclude_self);
+        E = local_apply_cached_masked(E, q, alphaSites, tholeA, useThole, ...
+            cache, target_mask, source_mask, softening, exclude_self);
     end
 end
 
-function E = local_apply_cached_symmetric(E, q, cache, mask, softening)
+function E = local_apply_cached_symmetric(E, q, alphaSites, tholeA, useThole, ...
+    cache, mask, softening)
 % Fast path for equal target/source masks with self excluded.
 % Uses unordered pair symmetry: pair (i,j) updates both i and j.
 
@@ -162,6 +203,23 @@ function E = local_apply_cached_symmetric(E, q, cache, mask, softening)
         r2 = r2Bare + softening^2;
         invR = 1 ./ sqrt(r2);
         invR3 = invR ./ r2;
+    end
+
+    if useThole
+        if softening == 0 && isfield(cache, 'thole_f3') && ~isempty(cache.thole_f3)
+            f3 = cache.thole_f3(usePair);
+        else
+            nPairsLocal = numel(pair_i);
+            f3 = zeros(nPairsLocal, 1);
+            rBare = sqrt(r2Bare);
+            for p = 1:nPairsLocal
+                i = pair_i(p);
+                j = pair_j(p);
+                tf = thole.thole_f3f5_factors(rBare(p), alphaSites(i), alphaSites(j), tholeA);
+                f3(p) = tf.f3;
+            end
+        end
+        invR3 = invR3 .* f3;
     end
 
     nPairs = numel(pair_i);
@@ -191,7 +249,8 @@ function E = local_apply_cached_symmetric(E, q, cache, mask, softening)
     end
 end
 
-function E = local_apply_cached_masked(E, q, cache, target_mask, source_mask, softening, exclude_self)
+function E = local_apply_cached_masked(E, q, alphaSites, tholeA, useThole, ...
+    cache, target_mask, source_mask, softening, exclude_self)
 % General masked cached path.
 
     pair_i = cache.pair_i;
@@ -205,6 +264,23 @@ function E = local_apply_cached_masked(E, q, cache, target_mask, source_mask, so
         r2 = r2Bare + softening^2;
         invR = 1 ./ sqrt(r2);
         invR3 = invR ./ r2;
+    end
+
+    if useThole
+        if softening == 0 && isfield(cache, 'thole_f3') && ~isempty(cache.thole_f3)
+            f3 = cache.thole_f3;
+        else
+            nPairsLocal = numel(pair_i);
+            f3 = zeros(nPairsLocal, 1);
+            rBare = sqrt(r2Bare);
+            for p = 1:nPairsLocal
+                i = pair_i(p);
+                j = pair_j(p);
+                tf = thole.thole_f3f5_factors(rBare(p), alphaSites(i), alphaSites(j), tholeA);
+                f3(p) = tf.f3;
+            end
+        end
+        invR3 = invR3 .* f3;
     end
 
     nPairs = numel(pair_i);
@@ -236,7 +312,8 @@ function E = local_apply_cached_masked(E, q, cache, target_mask, source_mask, so
     end
 end
 
-function E = local_apply_direct(pos, q, target_mask, source_mask, exclude_self, softening, rcut2)
+function E = local_apply_direct(pos, q, alphaSites, tholeA, useThole, ...
+    target_mask, source_mask, exclude_self, softening, rcut2)
 
     nSites = size(pos, 1);
     E = zeros(nSites, 3);
@@ -275,8 +352,15 @@ function E = local_apply_direct(pos, q, target_mask, source_mask, exclude_self, 
                 continue;
             end
 
-            r3 = r2^(3/2);
-            Ei = Ei + qj * rij / r3;
+            invR3 = 1 / (r2^(3/2));
+
+            if useThole
+                rBare = sqrt(r2_bare);
+                tf = thole.thole_f3f5_factors(rBare, alphaSites(i), alphaSites(j), tholeA);
+                invR3 = invR3 * tf.f3;
+            end
+
+            Ei = Ei + qj * rij * invR3;
         end
 
         E(i, :) = Ei;
