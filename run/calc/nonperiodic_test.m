@@ -13,7 +13,7 @@ cfg = struct();
 cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
 cfg.filename   = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
 
-cfg.supercellSize = [4 10 2];
+cfg.supercellSize = [5 11 3];
 cfg.bondScale     = 1.20;
 
 cfg.pairCharges = [+1 -1];
@@ -197,10 +197,21 @@ fprintf('[nonperiodic] building solver row cache...\n');
 tRowCache = tic;
 rowOpts = struct();
 rowOpts.rcut = cfg.nonperiodic.rcut;
-solveRowCache = geom.build_active_row_cache_direct(polsys, problem, rowOpts);
+rowOpts.profile = true;
+rowOpts.use_mex = true;
+
+% Prebuild active-space spatial index once and pass it in.
+posAct = polsys.site_pos(problem.activeSites, :);
+spatialOpts = struct();
+spatialOpts.isPeriodic = false;
+spatialOpts.method = 'auto';
+spatialOpts.cutoff = cfg.nonperiodic.rcut;
+spatial = geom.build_spatial_index(posAct, spatialOpts);
+
+solveRowCache = geom.build_active_row_cache(polsys, problem, rowOpts, spatial);
 timeRowCache = toc(tRowCache);
-fprintf('[nonperiodic] solver row cache done in %.6f s | nPolSites = %d\n', ...
-    timeRowCache, solveRowCache.nPolSites);
+fprintf('[nonperiodic] solver row cache done in %.6f s | nActive = %d\n', ...
+    timeRowCache, solveRowCache.nActive);
 
 sorParams.row_cache = solveRowCache;
 if isfield(sorParams, 'geom_cache')

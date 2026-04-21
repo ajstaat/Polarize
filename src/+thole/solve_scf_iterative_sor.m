@@ -110,7 +110,7 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
             rowOpts.rcut = inf;
         end
 
-        rowCache = geom.build_active_row_cache_direct(sys, problem, rowOpts);
+        rowCache = geom.build_active_row_cache(sys, problem, rowOpts);
     end
 
     % ---------------------------------------------------------------------

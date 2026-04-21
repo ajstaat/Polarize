@@ -231,7 +231,7 @@ function sys = make_crystal_system(crystal, model, opts)
     % -----------------------------
     molinfo = builder.identify_supercell_molecules(super, bondScale, ...
         'Verbose', sys.verbose, ...
-        'ProgressInterval', 250);
+        'ProgressInterval', 2500);
 
     sys.site_mol_id = molinfo.site_mol_id;
     sys.molecule_table = molinfo.component_table;

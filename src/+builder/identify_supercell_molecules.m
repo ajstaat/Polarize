@@ -16,7 +16,7 @@ function molinfo = identify_supercell_molecules(super, bondScale, varargin)
 %
 % Optional name-value inputs
 %   'Verbose'           logical, default false
-%   'ProgressInterval'  positive integer, default 250
+%   'ProgressInterval'  positive integer, default 2500
 %
 % Output
 %   molinfo struct with fields:
@@ -39,7 +39,7 @@ function molinfo = identify_supercell_molecules(super, bondScale, varargin)
 
     p = inputParser;
     addParameter(p, 'Verbose', false, @(x) islogical(x) && isscalar(x));
-    addParameter(p, 'ProgressInterval', 250, @(x) isnumeric(x) && isscalar(x) && x >= 1);
+    addParameter(p, 'ProgressInterval', 2500, @(x) isnumeric(x) && isscalar(x) && x >= 1);
     parse(p, varargin{:});
     opt = p.Results;
 
@@ -55,7 +55,8 @@ function molinfo = identify_supercell_molecules(super, bondScale, varargin)
         super.lattice, ...
         bondScale, ...
         'Verbose', opt.Verbose, ...
-        'ProgressInterval', opt.ProgressInterval);
+        'ProgressInterval', opt.ProgressInterval, ...
+        'ReturnDcart', false);
 
     siteMolID = conncomp(graph(A_pbc)).';
     molIDs = unique(siteMolID, 'stable');
@@ -95,11 +96,20 @@ function molinfo = identify_supercell_molecules(super, bondScale, varargin)
         component_table.largest_fragment_fraction(m) = displayInfo.largest_fragment_fraction;
 
         if opt.Verbose
-            fprintf('  molecule %d / %d (ID %d): complete=%d, fragments=%d\n', ...
-                m, nMol, thisMolID, ...
-                component_table.is_complete_in_display(m), ...
-                component_table.n_display_fragments(m));
+            if mod(m, opt.ProgressInterval) == 0 || m == nMol
+                fprintf('  checked %d / %d molecules\n', m, nMol);
+            end
         end
+    end
+
+    if opt.Verbose
+        nComplete = nnz(component_table.is_complete_in_display);
+        fragMin = min(component_table.n_display_fragments);
+        fragMax = max(component_table.n_display_fragments);
+        fprintf('identify_supercell_molecules: complete molecules = %d / %d\n', ...
+            nComplete, nMol);
+        fprintf('identify_supercell_molecules: display fragment count range = [%d, %d]\n', ...
+            fragMin, fragMax);
     end
 
     molinfo = struct();

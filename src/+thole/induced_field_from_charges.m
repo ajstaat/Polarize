@@ -192,7 +192,6 @@ function E = local_apply_target_source_cache(q, alphaSites, tholeA, useThole, ..
     r2Bare = cache.r2_bare(:);
 
     keep = target_mask(pair_i) & source_mask(pair_j);
-
     if ~any(keep)
         return;
     end
@@ -204,7 +203,6 @@ function E = local_apply_target_source_cache(q, alphaSites, tholeA, useThole, ..
 
     qj = q(pair_j);
     keepq = (qj ~= 0);
-
     if ~any(keepq)
         return;
     end
@@ -229,21 +227,15 @@ function E = local_apply_target_source_cache(q, alphaSites, tholeA, useThole, ..
             f3 = cache.thole_f3(keep);
             f3 = f3(keepq);
         else
-            nPairsLocal = numel(pair_i);
-            f3 = zeros(nPairsLocal, 1);
             rBare = sqrt(r2Bare);
-            for p = 1:nPairsLocal
-                i = pair_i(p);
-                j = pair_j(p);
-                tf = thole.thole_f3f5_factors(rBare(p), alphaSites(i), alphaSites(j), tholeA);
-                f3(p) = tf.f3;
-            end
+            tf = thole.thole_f3f5_factors(rBare, alphaSites(pair_i), alphaSites(pair_j), tholeA);
+            f3 = tf.f3;
         end
         invR3 = invR3 .* f3;
     end
 
     coeff = qj .* invR3;
-    contrib = (-dr) .* coeff;
+    contrib = (-dr) .* coeff;   % cache dr = r_source - r_target, need r_target - r_source
 
     E(:, 1) = accumarray(pair_i, contrib(:, 1), [nSites, 1], @sum, 0);
     E(:, 2) = accumarray(pair_i, contrib(:, 2), [nSites, 1], @sum, 0);
@@ -286,15 +278,9 @@ function E = local_apply_cached_legacy(q, alphaSites, tholeA, useThole, ...
         if softening == 0 && isfield(cache, 'thole_f3') && ~isempty(cache.thole_f3)
             f3 = cache.thole_f3(:);
         else
-            nPairsLocal = numel(pair_i);
-            f3 = zeros(nPairsLocal, 1);
             rBare = sqrt(r2Bare);
-            for p = 1:nPairsLocal
-                i = pair_i(p);
-                j = pair_j(p);
-                tf = thole.thole_f3f5_factors(rBare(p), alphaSites(i), alphaSites(j), tholeA);
-                f3(p) = tf.f3;
-            end
+            tf = thole.thole_f3f5_factors(rBare, alphaSites(pair_i), alphaSites(pair_j), tholeA);
+            f3 = tf.f3;
         end
         invR3 = invR3 .* f3;
     end
@@ -354,8 +340,8 @@ function E = local_apply_direct_vectorized(pos, q, alphaSites, tholeA, useThole,
         rj = pos(j, :);
 
         % r_ij = r_i - r_j for all targets
-        rij = targetPos - rj;               % nTarget x 3
-        r2_bare = sum(rij.^2, 2);          % nTarget x 1
+        rij = targetPos - rj;
+        r2_bare = sum(rij.^2, 2);
 
         keep = true(numel(targetIdx), 1);
 
@@ -375,8 +361,8 @@ function E = local_apply_direct_vectorized(pos, q, alphaSites, tholeA, useThole,
         r2_bare_keep = r2_bare(keep);
 
         r2 = r2_bare_keep + softening^2;
-
         nonzero = (r2 > 0);
+
         if ~all(nonzero)
             rij_keep = rij_keep(nonzero, :);
             r2_bare_keep = r2_bare_keep(nonzero);
@@ -390,20 +376,15 @@ function E = local_apply_direct_vectorized(pos, q, alphaSites, tholeA, useThole,
             continue;
         end
 
-        invR = 1 ./ sqrt(r2_bare_keep + softening^2);
-        invR3 = invR ./ (r2_bare_keep + softening^2);
+        r2 = r2_bare_keep + softening^2;
+        invR = 1 ./ sqrt(r2);
+        invR3 = invR ./ r2;
 
         if useThole
-            f3 = zeros(numel(keepIdx), 1);
             rBare = sqrt(r2_bare_keep);
-            alpha_j = alphaSites(j);
             tgtFull = targetIdx(keepIdx);
-            for k = 1:numel(keepIdx)
-                i = tgtFull(k);
-                tf = thole.thole_f3f5_factors(rBare(k), alphaSites(i), alpha_j, tholeA);
-                f3(k) = tf.f3;
-            end
-            invR3 = invR3 .* f3;
+            tf = thole.thole_f3f5_factors(rBare, alphaSites(tgtFull), alphaSites(j), tholeA);
+            invR3 = invR3 .* tf.f3;
         end
 
         Ework(keepIdx, :) = Ework(keepIdx, :) + qj .* rij_keep .* invR3;
