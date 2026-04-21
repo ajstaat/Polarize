@@ -23,29 +23,13 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
 %                                           geom.build_periodic_kspace_cache(...)
 %                   .problem                optional problem struct from
 %                                           thole.prepare_scf_problem(...)
+%                   .kspace_mode            'auto' | 'full' | 'chunked'
+%                   .kspace_memory_limit_gb positive scalar, default 8
+%                   .k_block_size           positive integer, default 2048
+%                   .verbose                logical, default false
 %
 % Output
 %   Edip          N x 3 periodic induced field
-%
-% Notes
-%   The periodic operator is applied as:
-%     E = E_real + E_recip + E_self + E_surf
-%
-%   Real-space action is cache-based with scalar coefficients:
-%     E_{i<-j} = coeff_iso * mu_j + coeff_dyad * dr * (dr · mu_j)
-%
-%   Reciprocal-space action uses cached phases and k-space invariants:
-%     E_i^recip = sum_k 2*pref(k) * [ cos_i * A_k + sin_i * B_k ] * (k k^T)
-%   where
-%     A_k = sum_j cos_j * (k·mu_j)
-%     B_k = sum_j sin_j * (k·mu_j)
-%
-%   The analytic self term contributes
-%     E_self(i) = -(4*alpha^3/(3*sqrt(pi))) * mu_i
-%
-%   For vacuum boundary conditions, the surface term contributes
-%     E_surf(i) = (4*pi/(3V)) * sum_j mu_j
-%   and is zero for tinfoil boundaries.
 
     io.assert_atomic_units(sys);
 
@@ -108,13 +92,17 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
         use_thole = logical(dipoleParams.use_thole);
     end
 
+    verbose = false;
+    if isfield(dipoleParams, 'verbose') && ~isempty(dipoleParams.verbose)
+        verbose = logical(dipoleParams.verbose);
+    end
+
     problem = [];
     if isfield(dipoleParams, 'problem') && ~isempty(dipoleParams.problem)
         problem = dipoleParams.problem;
     end
 
     if isempty(problem)
-        % Minimal problem-like struct for cache builders.
         polMask = logical(sys.site_is_polarizable(:));
         activeSites = find(polMask);
         problem = struct();
@@ -131,6 +119,7 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
     else
         cacheParams = struct();
         cacheParams.use_thole = use_thole;
+        cacheParams.verbose = verbose;
         realCache = geom.build_periodic_realspace_cache(sys, problem, ewaldParams, cacheParams);
     end
 
@@ -138,7 +127,18 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
     if isfield(dipoleParams, 'kspace_cache') && ~isempty(dipoleParams.kspace_cache)
         kCache = dipoleParams.kspace_cache;
     else
-        kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams);
+        kOpts = struct();
+        if isfield(dipoleParams, 'kspace_mode') && ~isempty(dipoleParams.kspace_mode)
+            kOpts.kspace_mode = dipoleParams.kspace_mode;
+        end
+        if isfield(dipoleParams, 'kspace_memory_limit_gb') && ~isempty(dipoleParams.kspace_memory_limit_gb)
+            kOpts.kspace_memory_limit_gb = dipoleParams.kspace_memory_limit_gb;
+        end
+        if isfield(dipoleParams, 'k_block_size') && ~isempty(dipoleParams.k_block_size)
+            kOpts.k_block_size = dipoleParams.k_block_size;
+        end
+        kOpts.verbose = verbose;
+        kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams, kOpts);
     end
 
     Edip = zeros(nSites, 3);
@@ -159,7 +159,6 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
         j = pair_j(p);
 
         if i == j
-            % Self-image interaction: one directed contribution on-site.
             if ~(target_mask(i) && source_mask(i))
                 continue;
             end
@@ -169,16 +168,15 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
                 continue;
             end
 
-            rij = dr(p, :);   % image displacement
+            rij = dr(p, :);
             muDotR = dot(muj, rij);
 
             Edip(i, :) = Edip(i, :) ...
                 + coeff_iso(p) * muj ...
                 + coeff_dyad(p) * rij * muDotR;
         else
-            rij = dr(p, :);   % r_j + R - r_i
+            rij = dr(p, :);
 
-            % Field at i from source j
             if target_mask(i) && source_mask(j)
                 muj = mu(j, :);
                 if ~all(muj == 0)
@@ -189,7 +187,6 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
                 end
             end
 
-            % Field at j from source i, using reversed directed displacement
             if target_mask(j) && source_mask(i)
                 mui = mu(i, :);
                 if ~all(mui == 0)
@@ -205,17 +202,6 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
 
     % ---------------------------------------------------------------------
     % Reciprocal-space contribution
-    %
-    % For each k:
-    %   v_j = k · mu_j
-    %   A_k = sum_j cos_j * v_j
-    %   B_k = sum_j sin_j * v_j
-    %
-    % Then for each target i:
-    %   phase_factor_i = cos_i * A_k + sin_i * B_k
-    %   E_i += 2 * pref(k) * phase_factor_i * (k k^T)
-    %
-    % Here we evaluate targets in active-space form, then scatter back.
 
     activeSites = kCache.activeSites(:);
     nPol = kCache.nPolSites;
@@ -223,54 +209,70 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
     if kCache.num_kvec > 0 && nPol > 0
         mu_pol = mu(activeSites, :);
 
-        % Apply source mask in active space.
         source_active = source_mask(activeSites);
         mu_src = mu_pol;
         mu_src(~source_active, :) = 0;
 
-        cos_phase = kCache.cos_phase;   % nPol x Nk
-        sin_phase = kCache.sin_phase;   % nPol x Nk
-        kvecs = kCache.kvecs;           % Nk x 3
-        pref = kCache.pref(:);          % Nk x 1
-        kk6 = kCache.kk6;               %#ok<NASGU>
-
-        % v = k · mu_j for all active sites and all k
-        % mu_src: nPol x 3, kvecs': 3 x Nk => nPol x Nk
-        v = mu_src * kvecs.';
-
-        % Structure-factor-like sums over sources
-        A = sum(cos_phase .* v, 1);   % 1 x Nk
-        B = sum(sin_phase .* v, 1);   % 1 x Nk
-
-        % Phase factor for each target site and each k
-        phase_factor = cos_phase .* A + sin_phase .* B;   % nPol x Nk
-
-        % Weight each k contribution
-        W = phase_factor .* (2 * pref.');                 % nPol x Nk
-
-        % Target-wise reciprocal field components:
-        %   Ex = sum_k W .* kx .* (k·e_x? no) => W * [kxx, kxy, kxz]
-        % More directly:
-        %   E_i = sum_k W(i,k) * [kxx kxy kxz; kxy kyy kyz; kxz kyz kzz] * [1;1;1]? no
-        % Since reciprocal operator acting on mu is already condensed into W through
-        % the source contraction v = k·mu, the field is:
-        %   E_i = sum_k W(i,k) * kvec(k,:)
-        % Wait: T_ij = 2*pref*cos * (k k^T), so acting on mu_j:
-        %   (k k^T) mu_j = k * (k·mu_j)
-        % Summing over j created A/B from (k·mu_j), so the target field is
-        %   E_i = sum_k 2*pref*phase_factor_i * k
-        % component-wise multiplied by k.
-        %
-        % Thus:
-        Ex_pol = W * kvecs(:, 1);
-        Ey_pol = W * kvecs(:, 2);
-        Ez_pol = W * kvecs(:, 3);
-
-        Erecip_pol = [Ex_pol, Ey_pol, Ez_pol];
-
-        % Apply target mask in active space before scatter.
         target_active = target_mask(activeSites);
-        Erecip_pol(~target_active, :) = 0;
+
+        kvecs = kCache.kvecs;
+        pref = kCache.pref(:);
+        nk = kCache.num_kvec;
+        two_pref = 2 * pref;
+
+        switch kCache.storage_mode
+            case 'full'
+                cos_phase = kCache.cos_phase;
+                sin_phase = kCache.sin_phase;
+
+                v = mu_src * kvecs.';
+                A = sum(cos_phase .* v, 1);
+                B = sum(sin_phase .* v, 1);
+
+                phase_factor = cos_phase .* A + sin_phase .* B;
+                W = phase_factor .* (two_pref.');
+
+                Ex_pol = W * kvecs(:, 1);
+                Ey_pol = W * kvecs(:, 2);
+                Ez_pol = W * kvecs(:, 3);
+
+                Erecip_pol = [Ex_pol, Ey_pol, Ez_pol];
+                Erecip_pol(~target_active, :) = 0;
+
+            case 'chunked'
+                pos_pol = kCache.active_pos;
+                blk = kCache.k_block_size;
+
+                Erecip_pol = zeros(nPol, 3);
+
+                for k0 = 1:blk:nk
+                    k1 = min(k0 + blk - 1, nk);
+                    idx = k0:k1;
+
+                    kblk = kvecs(idx, :);
+                    phase_blk = pos_pol * kblk.';
+                    cos_blk = cos(phase_blk);
+                    sin_blk = sin(phase_blk);
+
+                    v_blk = mu_src * kblk.';
+
+                    A_blk = sum(cos_blk .* v_blk, 1);
+                    B_blk = sum(sin_blk .* v_blk, 1);
+
+                    phase_factor_blk = cos_blk .* A_blk + sin_blk .* B_blk;
+                    W_blk = phase_factor_blk .* (two_pref(idx).');
+
+                    Erecip_pol(:, 1) = Erecip_pol(:, 1) + W_blk * kblk(:, 1);
+                    Erecip_pol(:, 2) = Erecip_pol(:, 2) + W_blk * kblk(:, 2);
+                    Erecip_pol(:, 3) = Erecip_pol(:, 3) + W_blk * kblk(:, 3);
+                end
+
+                Erecip_pol(~target_active, :) = 0;
+
+            otherwise
+                error('thole:induced_field_from_dipoles_thole_periodic:BadKspaceMode', ...
+                    'Unknown kCache.storage_mode "%s".', kCache.storage_mode);
+        end
 
         Edip(activeSites, :) = Edip(activeSites, :) + Erecip_pol;
     end
@@ -278,25 +280,16 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
     % ---------------------------------------------------------------------
     % Analytic self term
     %
-    % Tself block = -(4*alpha^3/(3*sqrt(pi))) I
-    % so E_self(i) = Tself * mu_i
+    % Validated sign: positive, to match assembled periodic Tpol.
 
     alpha = ewaldParams.alpha;
-    self_coeff = -(4 * alpha^3 / (3 * sqrt(pi)));
+    self_coeff = +(4 * alpha^3 / (3 * sqrt(pi)));
 
     self_sites = target_mask & source_mask;
     Edip(self_sites, :) = Edip(self_sites, :) + self_coeff * mu(self_sites, :);
 
     % ---------------------------------------------------------------------
     % Surface term
-    %
-    % For vacuum:
-    %   Tsurf block = (4*pi/(3V)) I between every pair
-    % so
-    %   E_surf(i) = (4*pi/(3V)) * sum_j mu_j
-    % over allowed source sites.
-    %
-    % For tinfoil: zero.
 
     boundary = 'tinfoil';
     if isfield(ewaldParams, 'boundary') && ~isempty(ewaldParams.boundary)
@@ -320,8 +313,6 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
 end
 
 function H = local_get_direct_lattice(sys)
-%LOCAL_GET_DIRECT_LATTICE Extract direct lattice matrix, columns are lattice vectors.
-
     if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
         H = sys.super_lattice;
     elseif isfield(sys, 'lattice') && ~isempty(sys.lattice)

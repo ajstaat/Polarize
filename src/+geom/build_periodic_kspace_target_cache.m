@@ -1,39 +1,12 @@
 function tCache = build_periodic_kspace_target_cache(sys, problem, ewaldParams, opts)
 %BUILD_PERIODIC_KSPACE_TARGET_CACHE Build reusable target-side reciprocal cache.
 %
-% tCache = geom.build_periodic_kspace_target_cache(sys, problem, ewaldParams)
-% tCache = geom.build_periodic_kspace_target_cache(sys, problem, ewaldParams, opts)
+% Refactored memory-light version:
+%   - stores target positions
+%   - stores k-space metadata / prefactors
+%   - does NOT store full target_cos / target_sin tables
 %
-% Inputs
-%   sys         canonical polarization-system struct
-%   problem     struct from thole.prepare_scf_problem(...)
-%   ewaldParams struct with fields:
-%       .alpha
-%       .kcut
-%       .boundary   optional, default 'tinfoil'
-%
-%   opts        optional struct with fields:
-%       .target_mask   N x 1 logical, optional
-%
-% Output
-%   tCache struct with fields:
-%       .mode
-%       .nSites
-%       .H
-%       .V
-%       .alpha
-%       .kcut
-%       .boundary
-%       .kvecs
-%       .k2
-%       .knorm
-%       .pref_base
-%       .num_kvec
-%       .hkmax
-%       .target_mask
-%       .targetSites
-%       .target_cos
-%       .target_sin
+% The calling code should evaluate target phases in k-blocks on demand.
 
     narginchk(3, 4);
 
@@ -84,6 +57,14 @@ function tCache = build_periodic_kspace_target_cache(sys, problem, ewaldParams, 
             'target_mask must have length nSites.');
     end
 
+    % Optional chunk size for on-the-fly phase evaluation
+    kBlockSize = 2048;
+    if isfield(opts, 'k_block_size') && ~isempty(opts.k_block_size)
+        kBlockSize = opts.k_block_size;
+    end
+    validateattributes(kBlockSize, {'double'}, {'scalar','integer','positive'}, ...
+        mfilename, 'opts.k_block_size');
+
     H = local_get_direct_lattice(sys);
     V = abs(det(H));
     if V <= 1e-14
@@ -92,20 +73,14 @@ function tCache = build_periodic_kspace_target_cache(sys, problem, ewaldParams, 
     end
 
     targetSites = find(targetMask);
+    pos_target = pos(targetSites, :);
 
     [kvecs, meta] = ewald.enumerate_kvecs_triclinic(H, kcut);
     nk = size(kvecs, 1);
 
     pref_base = zeros(nk, 1);
-    target_cos = zeros(numel(targetSites), nk);
-    target_sin = zeros(numel(targetSites), nk);
-
     if nk > 0
         pref_base = (4 * pi / V) * exp(-meta.k2(:) ./ (4 * alpha^2)) ./ meta.k2(:);
-        pos_target = pos(targetSites, :);
-        phase_target = pos_target * kvecs.';
-        target_cos = cos(phase_target);
-        target_sin = sin(phase_target);
     end
 
     tCache = struct();
@@ -126,8 +101,9 @@ function tCache = build_periodic_kspace_target_cache(sys, problem, ewaldParams, 
 
     tCache.target_mask = targetMask;
     tCache.targetSites = targetSites;
-    tCache.target_cos = target_cos;
-    tCache.target_sin = target_sin;
+    tCache.target_pos = pos_target;
+
+    tCache.k_block_size = kBlockSize;
 end
 
 function H = local_get_direct_lattice(sys)

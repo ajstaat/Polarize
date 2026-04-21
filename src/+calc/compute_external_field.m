@@ -18,6 +18,11 @@ function Eext = compute_external_field(sys, params)
 %       params.use_thole
 %   or  params.scf.use_thole
 %   if available.
+%
+% Notes
+%   This wrapper does NOT impose any cutoff by itself. Any truncation comes
+%   only from fields explicitly present in params.field (for example rcut or
+%   a cutoff-limited geom_cache).
 
     io.assert_atomic_units(sys);
 

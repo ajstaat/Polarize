@@ -116,10 +116,14 @@ function E = induced_field_from_charges_periodic(sys, fieldParams)
     end
 
     % -------------------------
-    % k-space cached path
+    % k-space memory-light path
     % -------------------------
     targetOpts = struct();
     targetOpts.target_mask = target_mask;
+
+    if isfield(fieldParams, 'k_block_size') && ~isempty(fieldParams.k_block_size)
+        targetOpts.k_block_size = fieldParams.k_block_size;
+    end
 
     targetCache = geom.build_periodic_kspace_target_cache(sys, problemRect, ew, targetOpts);
     sourceCache = geom.build_periodic_kspace_source_cache(sys, targetCache, source_mask);
@@ -129,12 +133,34 @@ function E = induced_field_from_charges_periodic(sys, fieldParams)
 
     Erecip = zeros(numel(tgt_idx), 3);
 
-    if targetCache.num_kvec > 0
-        Sterm = targetCache.target_sin .* kCoeff.rho_cos.' - ...
-                targetCache.target_cos .* kCoeff.rho_sin.';
+    nk = targetCache.num_kvec;
+    if nk > 0
+        kBlockSize = targetCache.k_block_size;
+        targetPos = targetCache.target_pos;   % nTarget x 3
+        kvecs = targetCache.kvecs;            % nk x 3
+        pref = kCoeff.pref(:);
+        rho_cos = kCoeff.rho_cos(:);
+        rho_sin = kCoeff.rho_sin(:);
 
-        for m = 1:targetCache.num_kvec
-            Erecip = Erecip + kCoeff.pref(m) * Sterm(:, m) * targetCache.kvecs(m, :);
+        for k0 = 1:kBlockSize:nk
+            k1 = min(k0 + kBlockSize - 1, nk);
+            idx = k0:k1;
+
+            kblk = kvecs(idx, :);                 % nb x 3
+            phase = targetPos * kblk.';           % nTarget x nb
+
+            C = cos(phase);
+            S = sin(phase);
+
+            % same convention as old code:
+            % Sterm = sin_i * rho_cos - cos_i * rho_sin
+            Sterm = S .* rho_cos(idx).' - C .* rho_sin(idx).';
+
+            w = Sterm .* pref(idx).';             % nTarget x nb
+
+            Erecip(:, 1) = Erecip(:, 1) + w * kblk(:, 1);
+            Erecip(:, 2) = Erecip(:, 2) + w * kblk(:, 2);
+            Erecip(:, 3) = Erecip(:, 3) + w * kblk(:, 3);
         end
     end
 

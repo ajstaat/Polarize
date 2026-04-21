@@ -1,9 +1,27 @@
-%% periodic_direct_vs_sor_real_crystal
-% Compare periodic direct solve vs periodic matrix-free SOR on a real crystal.
+%% periodic_loose_sor_timing_test
+% Periodic loose-SOR timing test for manual supercell-size sweeps.
+%
+% Intended use:
+%   - change cfg.supercellSize by hand
+%   - run
+%   - record timings / nIter / residual / energy
+%
+% This script:
+%   1) builds a charged-pair real-crystal test case
+%   2) computes periodic external field
+%   3) prepares the periodic SCF problem
+%   4) builds shared periodic matrix-free caches once
+%   5) runs loose matrix-free periodic SOR
+%   6) reports timing and final energy
+%
+% Notes:
+%   - Uses the validated periodic matrix-free SOR path
+%   - Uses shared-cache inputs so the solver itself does not rebuild caches
+%   - No direct solve or GMRES here; this is just the cheap timing driver
 
 clear; clc; close all;
 
-fprintf('=== periodic direct vs SOR (real crystal) ===\n');
+fprintf('=== periodic loose-SOR timing test ===\n');
 
 %% ------------------------------------------------------------------------
 % User controls
@@ -13,13 +31,14 @@ cfg = struct();
 cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
 cfg.filename   = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
 
+% Change this manually for timing sweeps
 cfg.supercellSize = [2 5 1];
-cfg.bondScale     = 1.20;
 
+cfg.bondScale   = 1.20;
 cfg.pairCharges = [+1 -1];
 
 cfg.use_thole = true;
-cfg.verbose = true;
+cfg.verbose   = true;
 cfg.softening = 0.0;
 
 cfg.periodic = struct();
@@ -28,6 +47,10 @@ cfg.periodic.rcut     = 12.0;
 cfg.periodic.kcut     = 3.5;
 cfg.periodic.boundary = 'tinfoil';
 
+% Optional chunk size for periodic charge-field k-space evaluation
+cfg.periodic.k_block_size = 2048;
+
+% Loose SOR settings
 cfg.sor = struct();
 cfg.sor.tol           = 1e-6;
 cfg.sor.maxIter       = 200;
@@ -165,25 +188,31 @@ ewaldParams.kcut     = cfg.periodic.kcut;
 ewaldParams.boundary = cfg.periodic.boundary;
 
 fprintf('\n============================================================\n');
-fprintf('PERIODIC SETTINGS\n');
+fprintf('PERIODIC LOOSE-SOR SETTINGS\n');
 fprintf('============================================================\n');
-fprintf('  alpha    = %.6f\n', ewaldParams.alpha);
-fprintf('  rcut     = %.6f bohr\n', ewaldParams.rcut);
-fprintf('  kcut     = %.6f bohr^-1\n', ewaldParams.kcut);
-fprintf('  boundary = %s\n', ewaldParams.boundary);
+fprintf('  supercell = [%d %d %d]\n', cfg.supercellSize);
+fprintf('  alpha     = %.6f\n', ewaldParams.alpha);
+fprintf('  rcut      = %.6f bohr\n', ewaldParams.rcut);
+fprintf('  kcut      = %.6f bohr^-1\n', ewaldParams.kcut);
+fprintf('  boundary  = %s\n', ewaldParams.boundary);
+fprintf('  tol       = %.3e\n', cfg.sor.tol);
+fprintf('  maxIter   = %d\n', cfg.sor.maxIter);
+fprintf('  omega     = %.3f\n', cfg.sor.omega);
+fprintf('  stopMetric= %s\n', cfg.sor.stopMetric);
 
 %% ------------------------------------------------------------------------
-% Build periodic external field once
+% Build periodic external field
 
 params_per = struct();
 params_per.use_thole = cfg.use_thole;
 params_per.field = struct();
-params_per.field.mode = 'periodic';
+params_per.field.mode = 'nonperiodic';
 params_per.field.exclude_self = true;
 params_per.field.use_thole_damping = cfg.use_thole;
 params_per.field.target_mask = targetMask;
 params_per.field.source_mask = sourceMask;
 params_per.field.ewald = ewaldParams;
+params_per.field.k_block_size = cfg.periodic.k_block_size;
 
 fprintf('\n[periodic] building external field...\n');
 tField = tic;
@@ -193,18 +222,21 @@ fprintf('[periodic] external field done in %.6f s | ||Eext||_F = %.16e\n', ...
     timeField, norm(Eext, 'fro'));
 
 %% ------------------------------------------------------------------------
-% Prepare shared SCF problem
+% Prepare SCF problem
 
 scfParams = struct();
 scfParams.use_thole = cfg.use_thole;
 scfParams.softening = cfg.softening;
 scfParams.verbose = true;
-scfParams.printEvery = cfg.sor.printEvery;
-scfParams.residualEvery = cfg.sor.residualEvery;
 scfParams.tol = cfg.sor.tol;
 scfParams.maxIter = cfg.sor.maxIter;
 scfParams.omega = cfg.sor.omega;
+scfParams.printEvery = cfg.sor.printEvery;
+scfParams.residualEvery = cfg.sor.residualEvery;
 scfParams.stopMetric = cfg.sor.stopMetric;
+scfParams.kspace_mode = 'auto';
+scfParams.kspace_memory_limit_gb = 8;
+scfParams.k_block_size = 2048;
 
 fprintf('[periodic] preparing SCF problem...\n');
 tProblem = tic;
@@ -213,66 +245,44 @@ timeProblem = toc(tProblem);
 fprintf('[periodic] problem prep done in %.6f s | nPolSites = %d\n', ...
     timeProblem, problem.nPolSites);
 
+%% ------------------------------------------------------------------------
+% Build shared matrix-free caches once, with separate timings
+
 fprintf('[periodic] building shared matrix-free caches...\n');
-tCache = tic;
 
 cacheParams = struct();
 cacheParams.use_thole = cfg.use_thole;
+cacheParams.verbose = true;
 
+tRealCache = tic;
 realCache_shared = geom.build_periodic_realspace_cache( ...
     polsys, problem, ewaldParams, cacheParams);
+timeRealCache = toc(tRealCache);
+fprintf('  real-space cache done in %.6f s | nReal=%d\n', ...
+    timeRealCache, realCache_shared.nInteractions);
 
+tRowCache = tic;
 rowCache_shared = geom.build_periodic_realspace_row_cache( ...
     polsys, problem, realCache_shared);
+timeRowCache = toc(tRowCache);
+fprintf('  row cache done in %.6f s | nDirected=%d\n', ...
+    timeRowCache, rowCache_shared.nInteractions);
 
+tKCache = tic;
 kCache_shared = geom.build_periodic_kspace_cache( ...
-    polsys, problem, ewaldParams);
+    polsys, problem, ewaldParams, scfParams);
+timeKCache = toc(tKCache);
+fprintf('  k-space cache done in %.6f s | nK=%d\n', ...
+    timeKCache, kCache_shared.num_kvec);
 
-timeCache = toc(tCache);
-fprintf('[periodic] shared cache build done in %.6f s | nReal=%d | nK=%d\n', ...
-    timeCache, realCache_shared.nInteractions, kCache_shared.num_kvec);
-
-%% ------------------------------------------------------------------------
-% DIRECT periodic solve
-
-fprintf('\n============================================================\n');
-fprintf('PERIODIC DIRECT SOLVE\n');
-fprintf('============================================================\n');
-
-fprintf('[direct] assembling periodic operator...\n');
-tAsm = tic;
-[Tpol, Tparts, opinfo] = ewald.assemble_periodic_interaction_matrix( ...
-    polsys, problem, ewaldParams, scfParams); %#ok<NASGU>
-timeAsm = toc(tAsm);
-fprintf('[direct] operator done in %.6f s\n', timeAsm);
-
-if isfield(opinfo, 'nRealInteractions')
-    fprintf('  nRealInteractions = %d\n', opinfo.nRealInteractions);
-end
-if isfield(opinfo, 'num_kvec')
-    fprintf('  num_kvec = %d\n', opinfo.num_kvec);
-end
-
-fprintf('[direct] solving direct SCF...\n');
-tDirect = tic;
-[mu_direct, scf_direct] = thole.solve_scf_direct(problem, Tpol); %#ok<NASGU>
-timeDirect = toc(tDirect);
-fprintf('[direct] solve done in %.6f s | ||mu||_2 = %.16e\n', ...
-    timeDirect, norm(mu_direct));
-
-fprintf('[direct] computing energies...\n');
-tDirectE = tic;
-E_direct = calc.compute_total_energy_active_space(polsys, problem, mu_direct, Eext, Tpol);
-relres_direct = thole.compute_active_space_relres(problem, Tpol, mu_direct);
-timeDirectE = toc(tDirectE);
-fprintf('[direct] energy postprocessing done in %.6f s | relres = %.16e\n', ...
-    timeDirectE, relres_direct);
+timeCache = timeRealCache + timeRowCache + timeKCache;
+fprintf('[periodic] shared cache build total = %.6f s\n', timeCache);
 
 %% ------------------------------------------------------------------------
-% PERIODIC SOR solve
+% Loose matrix-free periodic SOR solve
 
 fprintf('\n============================================================\n');
-fprintf('PERIODIC MATRIX-FREE SOR SOLVE\n');
+fprintf('PERIODIC MATRIX-FREE LOOSE SOR SOLVE\n');
 fprintf('============================================================\n');
 
 scfParams.realspace_cache = realCache_shared;
@@ -286,116 +296,99 @@ tSOR = tic;
 timeSOR = toc(tSOR);
 fprintf('[sor] solve done in %.6f s | ||mu||_2 = %.16e\n', ...
     timeSOR, norm(mu_sor));
-
-fprintf('[sor] computing energies with assembled Tpol for apples-to-apples comparison...\n');
-tSORE = tic;
-E_sor = calc.compute_total_energy_active_space(polsys, problem, mu_sor, Eext, Tpol);
-relres_sor_via_T = thole.compute_active_space_relres(problem, Tpol, mu_sor);
-timeSORE = toc(tSORE);
-fprintf('[sor] energy postprocessing done in %.6f s | relres(via Tpol) = %.16e\n', ...
-    timeSORE, relres_sor_via_T);
-
-fprintf('\n============================================================\n');
-fprintf('PERIODIC MATRIX-FREE GMRES SOLVE\n');
-fprintf('============================================================\n');
-
-gmresParams.realspace_cache = realCache_shared;
-gmresParams.realspace_row_cache = rowCache_shared;
-gmresParams.kspace_cache = kCache_shared;
-gmresParams = scfParams;
-gmresParams.restart = 30;              % try [] or 30 or 50
-gmresParams.maxIter = 50;              % outer cycles
-gmresParams.tol = 1e-6;
-gmresParams.use_preconditioner = true;
-gmresParams.verbose = true;
-
-fprintf('[gmres] solving periodic matrix-free GMRES...\n');
-tGMRES = tic;
-[mu_gmres, scf_gmres] = thole.solve_scf_iterative_periodic_gmres( ...
-    polsys, Eext, ewaldParams, gmresParams);
-timeGMRES = toc(tGMRES);
-fprintf('[gmres] solve done in %.6f s | ||mu||_2 = %.16e\n', ...
-    timeGMRES, norm(mu_gmres));
-fprintf('  converged = %d | flag = %d | relres(gmres) = %.16e | relres(physical) = %.16e\n', ...
-    scf_gmres.converged, scf_gmres.flag, scf_gmres.relres, scf_gmres.relres_physical);
-
-fprintf('[gmres] computing energies with assembled Tpol for apples-to-apples comparison...\n');
-tGMRESE = tic;
-E_gmres = calc.compute_total_energy_active_space(polsys, problem, mu_gmres, Eext, Tpol);
-relres_gmres_via_T = thole.compute_active_space_relres(problem, Tpol, mu_gmres);
-timeGMRESE = toc(tGMRESE);
-fprintf('[gmres] energy postprocessing done in %.6f s | relres(via Tpol) = %.16e\n', ...
-    timeGMRESE, relres_gmres_via_T);
-
-mu_diff_abs = norm(mu_gmres - mu_direct);
-mu_diff_rel = mu_diff_abs / max(norm(mu_direct), 1.0);
-
-Etot_diff_abs = abs(E_gmres.total - E_direct.total);
-Etot_diff_rel = Etot_diff_abs / max(abs(E_direct.total), 1.0);
-
-fprintf('\nGMRES comparison vs direct:\n');
-fprintf('  ||mu_gmres - mu_direct||_2   = %.16e\n', mu_diff_abs);
-fprintf('  relative mu difference       = %.16e\n', mu_diff_rel);
-fprintf('  |E_gmres - E_direct|         = %.16e Ha\n', Etot_diff_abs);
-fprintf('  relative energy difference   = %.16e\n', Etot_diff_rel);
+fprintf('  converged = %d | nIter = %d | relres(iterative) = %.16e\n', ...
+    scf_sor.converged, scf_sor.nIter, scf_sor.relres);
 
 %% ------------------------------------------------------------------------
-% Comparison summary
+% Post-solve energy / residual check without assembling Tpol
 
-mu_diff_abs = norm(mu_sor - mu_direct);
-mu_diff_rel = mu_diff_abs / max(norm(mu_direct), 1.0);
+fprintf('[sor] computing energy / physical residual...\n');
+tPost = tic;
 
-Etot_diff_abs = abs(E_sor.total - E_direct.total);
-Etot_diff_rel = Etot_diff_abs / max(abs(E_direct.total), 1.0);
+dipoleParams = struct();
+dipoleParams.use_thole = cfg.use_thole;
+dipoleParams.problem = problem;
+dipoleParams.target_mask = problem.polMask;
+dipoleParams.source_mask = problem.polMask;
+dipoleParams.realspace_cache = realCache_shared;
+dipoleParams.kspace_cache = kCache_shared;
+
+Edip = thole.induced_field_from_dipoles_thole_periodic( ...
+    polsys, mu_sor, ewaldParams, dipoleParams);
+
+rhs = zeros(problem.nSites, 3);
+rhs(problem.polMask, :) = problem.alpha(problem.polMask) .* ...
+    (Eext(problem.polMask, :) + Edip(problem.polMask, :));
+
+r = rhs(problem.polMask, :) - mu_sor(problem.polMask, :);
+bn = norm(rhs(problem.polMask, :), 'fro');
+if bn == 0
+    bn = 1.0;
+end
+relres_phys = norm(r, 'fro') / bn;
+
+polMask = problem.polMask;
+mu_pol = mu_sor(polMask, :);
+Eext_pol = Eext(polMask, :);
+Edip_pol = Edip(polMask, :);
+
+E_total = -0.5 * sum(sum(mu_pol .* Eext_pol));
+
+timePost = toc(tPost);
+
+fprintf('[sor] postprocessing done in %.6f s\n', timePost);
+fprintf('  relres(physical) = %.16e\n', relres_phys);
+fprintf('  total energy     = %+0.12e Ha\n', E_total);
+
+%% ------------------------------------------------------------------------
+% Timing summary
 
 fprintf('\n============================================================\n');
-fprintf('COMPARISON SUMMARY\n');
+fprintf('TIMING SUMMARY\n');
 fprintf('============================================================\n');
+fprintf('  field_time_s      = %.6f\n', timeField);
+fprintf('  problem_time_s    = %.6f\n', timeProblem);
+fprintf('  real_cache_s      = %.6f\n', timeRealCache);
+fprintf('  row_cache_s       = %.6f\n', timeRowCache);
+fprintf('  k_cache_s         = %.6f\n', timeKCache);
+fprintf('  shared_cache_s    = %.6f\n', timeCache);
+fprintf('  sor_solve_s       = %.6f\n', timeSOR);
+fprintf('  postprocess_s     = %.6f\n', timePost);
 
-fprintf('Direct solve:\n');
-fprintf('  total                  = %+0.12e Ha\n', E_direct.total);
-if isfield(E_direct, 'polarization_self')
-    fprintf('  polarization_self      = %+0.12e Ha\n', E_direct.polarization_self);
-end
-if isfield(E_direct, 'external_charge_dipole')
-    fprintf('  external_charge_dipole = %+0.12e Ha\n', E_direct.external_charge_dipole);
-end
-if isfield(E_direct, 'dipole_dipole')
-    fprintf('  dipole_dipole          = %+0.12e Ha\n', E_direct.dipole_dipole);
-end
-fprintf('  relres                 = %.16e\n', relres_direct);
+q = polsys.site_charge(:);
+r = polsys.site_pos;
 
-fprintf('\nSOR solve:\n');
-fprintf('  total                  = %+0.12e Ha\n', E_sor.total);
-if isfield(E_sor, 'polarization_self')
-    fprintf('  polarization_self      = %+0.12e Ha\n', E_sor.polarization_self);
-end
-if isfield(E_sor, 'external_charge_dipole')
-    fprintf('  external_charge_dipole = %+0.12e Ha\n', E_sor.external_charge_dipole);
-end
-if isfield(E_sor, 'dipole_dipole')
-    fprintf('  dipole_dipole          = %+0.12e Ha\n', E_sor.dipole_dipole);
-end
-fprintf('  relres(iterative)      = %.16e\n', scf_sor.relres);
-fprintf('  relres(via Tpol)       = %.16e\n', relres_sor_via_T);
-fprintf('  converged              = %d\n', scf_sor.converged);
-fprintf('  nIter                  = %d\n', scf_sor.nIter);
+p_src = sum(q .* r, 1);          % e*bohr
+p_ind = sum(mu_sor, 1);          % e*bohr
+p_tot = p_src + p_ind;           % e*bohr
 
-fprintf('\nDifferences:\n');
-fprintf('  ||mu_sor - mu_direct||_2      = %.16e\n', mu_diff_abs);
-fprintf('  relative mu difference        = %.16e\n', mu_diff_rel);
-fprintf('  |E_sor - E_direct|            = %.16e Ha\n', Etot_diff_abs);
-fprintf('  relative energy difference    = %.16e\n', Etot_diff_rel);
+convD = 2.541746;
 
-fprintf('\nTiming summary:\n');
-fprintf('  field_time_s          = %.6f\n', timeField);
-fprintf('  problem_time_s        = %.6f\n', timeProblem);
-fprintf('  direct_operator_s     = %.6f\n', timeAsm);
-fprintf('  direct_solve_s        = %.6f\n', timeDirect);
-fprintf('  direct_energy_s       = %.6f\n', timeDirectE);
-fprintf('  sor_solve_s           = %.6f\n', timeSOR);
-fprintf('  sor_energy_s          = %.6f\n', timeSORE);
+fprintf('Bare source dipole  (e*bohr): [% .6f % .6f % .6f]\n', p_src);
+fprintf('Bare source |p|     = %.6f e*bohr = %.6f D\n', norm(p_src), norm(p_src)*convD);
 
+fprintf('Induced dipole sum  (e*bohr): [% .6f % .6f % .6f]\n', p_ind);
+fprintf('Induced    |p|      = %.6f e*bohr = %.6f D\n', norm(p_ind), norm(p_ind)*convD);
+
+fprintf('Total cell dipole   (e*bohr): [% .6f % .6f % .6f]\n', p_tot);
+fprintf('Total      |p|      = %.6f e*bohr = %.6f D\n', norm(p_tot), norm(p_tot)*convD);
+
+polMask = logical(polsys.site_is_polarizable(:));
+
+mu_pol   = mu_sor(polMask, :);
+Eext_pol = Eext(polMask, :);
+Edip_pol = Edip(polMask, :);
+Eloc_pol = Eext_pol + Edip_pol;
+
+fprintf('sum |Eext_i|^2   = %.16e\n', sum(sum(Eext_pol.^2)));
+fprintf('sum |Edip_i|^2   = %.16e\n', sum(sum(Edip_pol.^2)));
+fprintf('sum |Eloc_i|^2   = %.16e\n', sum(sum(Eloc_pol.^2)));
+
+fprintf('sum mu_i·Eext_i  = %.16e\n', sum(sum(mu_pol .* Eext_pol)));
+fprintf('sum mu_i·Edip_i  = %.16e\n', sum(sum(mu_pol .* Edip_pol)));
+fprintf('sum mu_i·Eloc_i  = %.16e\n', sum(sum(mu_pol .* Eloc_pol)));
+
+fprintf('sum |mu_i|^2     = %.16e\n', sum(sum(mu_pol.^2)));
 fprintf('\nDone.\n');
 
 %% ========================================================================

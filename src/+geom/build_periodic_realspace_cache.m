@@ -1,58 +1,12 @@
 function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfParams)
 %BUILD_PERIODIC_REALSPACE_CACHE Build periodic real-space Ewald interaction cache.
 %
-% cache = geom.build_periodic_realspace_cache(sys, problem, ewaldParams)
-% cache = geom.build_periodic_realspace_cache(sys, problem, ewaldParams, scfParams)
+% Chunked one-pass version:
+%   - avoids separate count pass
+%   - avoids AGROW inside the hot inner loop
+%   - accumulates one chunk per outer aa and concatenates once
 %
-% Inputs
-%   sys         canonical polarization-system struct in atomic units
-%   problem     struct from thole.prepare_scf_problem(...)
-%   ewaldParams struct with fields:
-%       .alpha     Ewald screening parameter
-%       .rcut      real-space cutoff
-%
-%   scfParams   optional struct with fields:
-%       .use_thole   logical, default true
-%
-% Output
-%   cache       struct with periodic real-space pair-image interactions
-%
-% Fields
-%   .mode               'periodic_realspace'
-%   .nSites
-%   .site_mask
-%   .site_idx
-%   .activeSites
-%   .pair_i             full-site target index
-%   .pair_j             full-site source index
-%   .image_n            integer image coefficients [nx ny nz]
-%   .dr                 xvec = r_j + R - r_i
-%   .r_bare
-%   .r2_bare
-%   .coeff_iso          scalar coefficient multiplying mu_j
-%   .coeff_dyad         scalar coefficient multiplying xvec*(xvec·mu_j)
-%   .alpha
-%   .rcut
-%   .use_thole
-%   .real_image_bounds
-%   .nImageShifts
-%   .nInteractions
-%   .includes_self_image
-%
-% Notes
-%   - This is the periodic real-space analog of the nonperiodic pair cache.
-%   - The tensor action is represented as
-%         E_{i<-j} = coeff_iso * mu_j + coeff_dyad * xvec * (xvec · mu_j)
-%     where xvec = r_j + R - r_i.
-%   - coeff_iso / coeff_dyad already include the optional real-space Thole
-%     correction when scfParams.use_thole is true.
-%   - Distinct-site interactions are stored once per unordered pair-image
-%     object (i < j), plus self-image entries with i == j and R ~= 0.
-%   - Central self (i == j, R == 0) is excluded.
-%   - This implementation uses a two-pass strategy:
-%       pass 1: count surviving interactions
-%       pass 2: allocate exactly and fill
-%     to avoid pathological worst-case memory allocation.
+% Output format matches the previous implementation.
 
     narginchk(3, 4);
 
@@ -62,6 +16,13 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
 
     validateattributes(problem, {'struct'}, {'scalar'}, mfilename, 'problem', 2);
     validateattributes(ewaldParams, {'struct'}, {'scalar'}, mfilename, 'ewaldParams', 3);
+
+    verbose = false;
+    if isfield(scfParams, 'verbose') && ~isempty(scfParams.verbose)
+        verbose = logical(scfParams.verbose);
+    end
+
+    tTotal = tic;
 
     if ~isfield(sys, 'site_pos') || isempty(sys.site_pos)
         error('geom:build_periodic_realspace_cache:MissingSitePos', ...
@@ -136,6 +97,8 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
     nzmax = ceil(rcut / norm(c)) + 1;
 
     % Enumerate all image shifts once.
+    tEnum = tic;
+
     nAllocR = (2*nxmax + 1) * (2*nymax + 1) * (2*nzmax + 1);
     imageN = zeros(nAllocR, 3);
     Rshifts = zeros(nAllocR, 3);
@@ -158,70 +121,61 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
     Rshifts = Rshifts(1:nR, :);
     isZeroShift = isZeroShift(1:nR);
 
-    rcut2 = rcut^2;
+    timeEnum = toc(tEnum);
 
+    rcut2 = rcut^2;
     alpha2 = alpha^2;
     twoAlphaOverSqrtPi = 2 * alpha / sqrt(pi);
 
+    if verbose
+        fprintf(['build_periodic_realspace_cache: nActive=%d | rcut=%.6f | ' ...
+                 'image bounds=[%d %d %d] | nImageShifts=%d\n'], ...
+            nActive, rcut, nxmax, nymax, nzmax, nR);
+        fprintf('  image enumeration done in %.3f s\n', timeEnum);
+    end
+
     % ------------------------------------------------------------------
-    % PASS 1: count exact number of surviving interactions
+    % Distinct-site accumulation: one chunk per outer aa
 
-    nKeep = 0;
+    tDistinct = tic;
 
-    % Distinct-site interactions: i < j
+    nChunk = max(nActive - 1, 1);
+    pair_i_cells      = cell(nChunk, 1);
+    pair_j_cells      = cell(nChunk, 1);
+    image_n_cells     = cell(nChunk, 1);
+    dr_cells          = cell(nChunk, 1);
+    r_bare_cells      = cell(nChunk, 1);
+    r2_bare_cells     = cell(nChunk, 1);
+    coeff_iso_cells   = cell(nChunk, 1);
+    coeff_dyad_cells  = cell(nChunk, 1);
+
+    nDistinctKept = 0;
+
+    % Heuristic initial capacity per aa chunk.
+    % Large enough to reduce reallocations, small enough not to explode memory.
+    initCap = max(4096, 8 * nR);
+
     for aa = 1:(nActive - 1)
         i = activeSites(aa);
         ri = pos(i, :);
 
-        for bb = (aa + 1):nActive
-            j = activeSites(bb);
-            rij0 = pos(j, :) - ri;      % r_j - r_i
+        cap = initCap;
+        cursor = 0;
 
-            xvec = rij0 + Rshifts;      % nR x 3
-            x2 = sum(xvec.^2, 2);
-
-            keep = (x2 > 0) & (x2 <= rcut2);
-            nKeep = nKeep + nnz(keep);
-        end
-    end
-
-    % Self-image interactions: i == j, R ~= 0 only
-    keepSelf = ~isZeroShift;
-    Rself = Rshifts(keepSelf, :);
-    imageSelf = imageN(keepSelf, :);
-
-    if ~isempty(Rself)
-        x2 = sum(Rself.^2, 2);
-        keep = (x2 > 0) & (x2 <= rcut2);
-        nSelfPerSite = nnz(keep);
-        nKeep = nKeep + nActive * nSelfPerSite;
-    end
-
-    % Allocate exactly
-    pair_i = zeros(nKeep, 1);
-    pair_j = zeros(nKeep, 1);
-    image_n = zeros(nKeep, 3);
-    dr_all = zeros(nKeep, 3);
-    r_bare_all = zeros(nKeep, 1);
-    r2_bare_all = zeros(nKeep, 1);
-    coeff_iso_all = zeros(nKeep, 1);
-    coeff_dyad_all = zeros(nKeep, 1);
-
-    % ------------------------------------------------------------------
-    % PASS 2: fill arrays
-
-    nFill = 0;
-
-    % Distinct-site interactions: i < j, all image shifts inside cutoff.
-    for aa = 1:(nActive - 1)
-        i = activeSites(aa);
-        ri = pos(i, :);
+        pair_i_blk     = zeros(cap, 1);
+        pair_j_blk     = zeros(cap, 1);
+        image_n_blk    = zeros(cap, 3);
+        dr_blk         = zeros(cap, 3);
+        r_bare_blk     = zeros(cap, 1);
+        r2_bare_blk    = zeros(cap, 1);
+        coeff_iso_blk  = zeros(cap, 1);
+        coeff_dyad_blk = zeros(cap, 1);
 
         for bb = (aa + 1):nActive
             j = activeSites(bb);
-            rij0 = pos(j, :) - ri;      % r_j - r_i
+            rij0 = pos(j, :) - ri;
 
-            xvec = rij0 + Rshifts;      % nR x 3
+            xvec = rij0 + Rshifts;
             x2 = sum(xvec.^2, 2);
             keep = (x2 > 0) & (x2 <= rcut2);
 
@@ -243,8 +197,6 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
             invx5 = invx3 .* invx2;
             invx4 = invx2.^2;
 
-            % Field-tensor convention matching thole.dipole_tensor_block:
-            %   T = -B I + C xx^T
             B = erfcax .* invx3 + twoAlphaOverSqrtPi * expax2 .* invx2;
             C = 3 .* erfcax .* invx5 + twoAlphaOverSqrtPi .* ...
                 (2 .* alpha2 .* invx2 + 3 .* invx4) .* expax2;
@@ -259,25 +211,73 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
             end
 
             m = numel(xkeep);
-            idx = (nFill + 1):(nFill + m);
+            need = cursor + m;
 
-            pair_i(idx) = i;
-            pair_j(idx) = j;
-            image_n(idx, :) = imageKeep;
-            dr_all(idx, :) = xveckeep;
-            r_bare_all(idx) = xkeep;
-            r2_bare_all(idx) = x2keep;
-            coeff_iso_all(idx) = coeff_iso;
-            coeff_dyad_all(idx) = coeff_dyad;
+            if need > cap
+                newCap = cap;
+                while need > newCap
+                    newCap = 2 * newCap;
+                end
 
-            nFill = nFill + m;
+                pair_i_blk(newCap, 1) = 0;
+                pair_j_blk(newCap, 1) = 0;
+                image_n_blk(newCap, 3) = 0;
+                dr_blk(newCap, 3) = 0;
+                r_bare_blk(newCap, 1) = 0;
+                r2_bare_blk(newCap, 1) = 0;
+                coeff_iso_blk(newCap, 1) = 0;
+                coeff_dyad_blk(newCap, 1) = 0;
+
+                cap = newCap;
+            end
+
+            idx = (cursor + 1):(cursor + m);
+
+            pair_i_blk(idx) = i;
+            pair_j_blk(idx) = j;
+            image_n_blk(idx, :) = imageKeep;
+            dr_blk(idx, :) = xveckeep;
+            r_bare_blk(idx) = xkeep;
+            r2_bare_blk(idx) = x2keep;
+            coeff_iso_blk(idx) = coeff_iso;
+            coeff_dyad_blk(idx) = coeff_dyad;
+
+            cursor = need;
+            nDistinctKept = nDistinctKept + m;
         end
+
+        pair_i_cells{aa}     = pair_i_blk(1:cursor);
+        pair_j_cells{aa}     = pair_j_blk(1:cursor);
+        image_n_cells{aa}    = image_n_blk(1:cursor, :);
+        dr_cells{aa}         = dr_blk(1:cursor, :);
+        r_bare_cells{aa}     = r_bare_blk(1:cursor);
+        r2_bare_cells{aa}    = r2_bare_blk(1:cursor);
+        coeff_iso_cells{aa}  = coeff_iso_blk(1:cursor);
+        coeff_dyad_cells{aa} = coeff_dyad_blk(1:cursor);
     end
 
-    % Self-image interactions: i == j, R ~= 0 only.
+    timeDistinct = toc(tDistinct);
+
+    % ------------------------------------------------------------------
+    % Self-image accumulation
+
+    tSelf = tic;
+
     keepSelf = ~isZeroShift;
     Rself = Rshifts(keepSelf, :);
     imageSelf = imageN(keepSelf, :);
+
+    pair_i_self = zeros(0,1);
+    pair_j_self = zeros(0,1);
+    image_n_self = zeros(0,3);
+    dr_self = zeros(0,3);
+    r_bare_self = zeros(0,1);
+    r2_bare_self = zeros(0,1);
+    coeff_iso_self_all = zeros(0,1);
+    coeff_dyad_self_all = zeros(0,1);
+
+    nSelfKept = 0;
+    nSelfPerSite = 0;
 
     if ~isempty(Rself)
         x2 = sum(Rself.^2, 2);
@@ -288,6 +288,7 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
             imageSelf = imageSelf(keep, :);
             x2 = x2(keep);
             x = sqrt(x2);
+            nSelfPerSite = numel(x);
 
             erfcax = erfc(alpha * x);
             expax2 = exp(-alpha2 * x2);
@@ -302,14 +303,25 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
             C = 3 .* erfcax .* invx5 + twoAlphaOverSqrtPi .* ...
                 (2 .* alpha2 .* invx2 + 3 .* invx4) .* expax2;
 
-            coeff_iso_self = -B;
-            coeff_dyad_self = +C;
+            coeff_iso_base = -B;
+            coeff_dyad_base = +C;
 
+            nSelfTotal = nActive * nSelfPerSite;
+            pair_i_self = zeros(nSelfTotal, 1);
+            pair_j_self = zeros(nSelfTotal, 1);
+            image_n_self = zeros(nSelfTotal, 3);
+            dr_self = zeros(nSelfTotal, 3);
+            r_bare_self = zeros(nSelfTotal, 1);
+            r2_bare_self = zeros(nSelfTotal, 1);
+            coeff_iso_self_all = zeros(nSelfTotal, 1);
+            coeff_dyad_self_all = zeros(nSelfTotal, 1);
+
+            cursor = 0;
             for aa = 1:nActive
                 i = activeSites(aa);
 
-                coeff_iso = coeff_iso_self;
-                coeff_dyad = coeff_dyad_self;
+                coeff_iso = coeff_iso_base;
+                coeff_dyad = coeff_dyad_base;
 
                 if use_thole
                     tf = local_thole_factors_vectorized(x, alpha_site(i), alpha_site(i), thole_a);
@@ -317,27 +329,66 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
                     coeff_dyad = coeff_dyad + 3 .* tf.l5 .* invx5;
                 end
 
-                m = numel(x);
-                idx = (nFill + 1):(nFill + m);
+                m = nSelfPerSite;
+                idx = (cursor + 1):(cursor + m);
 
-                pair_i(idx) = i;
-                pair_j(idx) = i;
-                image_n(idx, :) = imageSelf;
-                dr_all(idx, :) = Rself;
-                r_bare_all(idx) = x;
-                r2_bare_all(idx) = x2;
-                coeff_iso_all(idx) = coeff_iso;
-                coeff_dyad_all(idx) = coeff_dyad;
+                pair_i_self(idx) = i;
+                pair_j_self(idx) = i;
+                image_n_self(idx, :) = imageSelf;
+                dr_self(idx, :) = Rself;
+                r_bare_self(idx) = x;
+                r2_bare_self(idx) = x2;
+                coeff_iso_self_all(idx) = coeff_iso;
+                coeff_dyad_self_all(idx) = coeff_dyad;
 
-                nFill = nFill + m;
+                cursor = cursor + m;
             end
+
+            nSelfKept = nSelfTotal;
         end
     end
 
-    if nFill ~= nKeep
-        error('geom:build_periodic_realspace_cache:FillCountMismatch', ...
-            'Two-pass fill count mismatch: counted %d, filled %d.', nKeep, nFill);
+    timeSelf = toc(tSelf);
+
+    % ------------------------------------------------------------------
+    % Concatenate once
+
+    tConcat = tic;
+
+    if nActive > 1
+        pair_i = vertcat(pair_i_cells{:});
+        pair_j = vertcat(pair_j_cells{:});
+        image_n = vertcat(image_n_cells{:});
+        dr_all = vertcat(dr_cells{:});
+        r_bare_all = vertcat(r_bare_cells{:});
+        r2_bare_all = vertcat(r2_bare_cells{:});
+        coeff_iso_all = vertcat(coeff_iso_cells{:});
+        coeff_dyad_all = vertcat(coeff_dyad_cells{:});
+    else
+        pair_i = zeros(0,1);
+        pair_j = zeros(0,1);
+        image_n = zeros(0,3);
+        dr_all = zeros(0,3);
+        r_bare_all = zeros(0,1);
+        r2_bare_all = zeros(0,1);
+        coeff_iso_all = zeros(0,1);
+        coeff_dyad_all = zeros(0,1);
     end
+
+    if nSelfKept > 0
+        pair_i = [pair_i; pair_i_self];
+        pair_j = [pair_j; pair_j_self];
+        image_n = [image_n; image_n_self];
+        dr_all = [dr_all; dr_self];
+        r_bare_all = [r_bare_all; r_bare_self];
+        r2_bare_all = [r2_bare_all; r2_bare_self];
+        coeff_iso_all = [coeff_iso_all; coeff_iso_self_all];
+        coeff_dyad_all = [coeff_dyad_all; coeff_dyad_self_all];
+    end
+
+    timeConcat = toc(tConcat);
+
+    nKeep = numel(pair_i);
 
     cache = struct();
     cache.mode = 'periodic_realspace';
@@ -365,11 +416,27 @@ function cache = build_periodic_realspace_cache(sys, problem, ewaldParams, scfPa
     cache.nImageShifts = nR;
     cache.nInteractions = nKeep;
     cache.includes_self_image = true;
+
+    cache.timing = struct();
+    cache.timing.image_enum_s     = timeEnum;
+    cache.timing.distinct_fill_s  = timeDistinct;
+    cache.timing.self_fill_s      = timeSelf;
+    cache.timing.concat_s         = timeConcat;
+    cache.timing.total_s          = toc(tTotal);
+    cache.timing.nDistinctKept    = nDistinctKept;
+    cache.timing.nSelfKept        = nSelfKept;
+    cache.timing.nSelfPerSite     = nSelfPerSite;
+
+    if verbose
+        fprintf('  distinct fill done in %.3f s | kept=%d\n', timeDistinct, nDistinctKept);
+        fprintf('  self-image fill done in %.3f s | nSelfPerSite=%d | kept=%d\n', ...
+            timeSelf, nSelfPerSite, nSelfKept);
+        fprintf('  concatenate done in %.3f s\n', timeConcat);
+        fprintf('build_periodic_realspace_cache: total time = %.3f s\n', cache.timing.total_s);
+    end
 end
 
 function H = local_get_direct_lattice(sys)
-%LOCAL_GET_DIRECT_LATTICE Extract direct lattice matrix, columns are lattice vectors.
-
     if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
         H = sys.super_lattice;
     elseif isfield(sys, 'lattice') && ~isempty(sys.lattice)
@@ -384,10 +451,6 @@ function H = local_get_direct_lattice(sys)
 end
 
 function tf = local_thole_factors_vectorized(r, alpha_i, alpha_j, thole_a)
-%LOCAL_THOLE_FACTORS_VECTORIZED Vectorized Thole factors for one site pair and many distances.
-%
-% Mirrors thole.thole_f3f5_factors but for vector input r.
-
     if alpha_i < 0 || alpha_j < 0
         error('geom:build_periodic_realspace_cache:NegativeAlpha', ...
             'alpha_i and alpha_j must be nonnegative.');

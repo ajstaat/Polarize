@@ -2,7 +2,7 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
 %SOLVE_SCF_ITERATIVE_SOR Matrix-free GS/SOR solve using row-wise cached neighbors.
 %
 % This solver does NOT assemble dense Tpol. It performs row sweeps over a
-% directed active-space neighbor cache derived from the nonperiodic pair cache.
+% directed active-space neighbor cache.
 %
 % Fixed-point update on active polarizable sites:
 %   mu_i = alpha_i * (Eext_i + sum_j T_ij mu_j)
@@ -25,6 +25,9 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
 %   .stopMetric        'max_dmu' | 'relres'
 %   .softening
 %   .rcut
+%   .row_cache         optional prebuilt active row cache
+%   .geom_cache        optional legacy unordered pair cache
+%   .checkResidualAgainstLegacy   logical, default false
 %
 % Output
 %   mu         N x 3 induced dipoles
@@ -67,18 +70,80 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
         softening = scfParams.softening;
     end
 
-    % Build unordered pair cache once, then directed row cache.
-    cacheOpts = struct();
-    cacheOpts.site_mask = polMask;
-
-    if isfield(scfParams, 'rcut') && ~isempty(scfParams.rcut)
-        cacheOpts.rcut = scfParams.rcut;
-    else
-        cacheOpts.rcut = inf;
+    checkResidualAgainstLegacy = false;
+    if isfield(scfParams, 'checkResidualAgainstLegacy') && ~isempty(scfParams.checkResidualAgainstLegacy)
+        checkResidualAgainstLegacy = logical(scfParams.checkResidualAgainstLegacy);
     end
 
-    pairCache = geom.build_nonperiodic_pair_cache(sys, cacheOpts);
-    rowCache = geom.build_active_row_cache(sys, problem, pairCache);
+    % ---------------------------------------------------------------------
+    % Row cache for actual solver work
+    % Priority:
+    %   1) caller-provided row_cache
+    %   2) caller-provided legacy geom_cache -> convert to row cache
+    %   3) build row cache directly
+    % ---------------------------------------------------------------------
+    useCallerRowCache = isfield(scfParams, 'row_cache') && ~isempty(scfParams.row_cache);
+    useCallerGeomCache = isfield(scfParams, 'geom_cache') && ~isempty(scfParams.geom_cache);
+
+    if useCallerRowCache
+        rowCache = scfParams.row_cache;
+    elseif useCallerGeomCache
+        pairCache = scfParams.geom_cache;
+
+        requestedRcut = inf;
+        if isfield(scfParams, 'rcut') && ~isempty(scfParams.rcut)
+            requestedRcut = scfParams.rcut;
+        end
+
+        if isfield(pairCache, 'rcut') && isfinite(requestedRcut) && pairCache.rcut + 1e-12 < requestedRcut
+            error('thole:solve_scf_iterative_sor:CacheRcutMismatch', ...
+                'Provided geom_cache has rcut=%.6g but solver requested rcut=%.6g.', ...
+                pairCache.rcut, requestedRcut);
+        end
+
+        rowCache = geom.build_active_row_cache(sys, problem, pairCache);
+    else
+        rowOpts = struct();
+        if isfield(scfParams, 'rcut') && ~isempty(scfParams.rcut)
+            rowOpts.rcut = scfParams.rcut;
+        else
+            rowOpts.rcut = inf;
+        end
+
+        rowCache = geom.build_active_row_cache_direct(sys, problem, rowOpts);
+    end
+
+    % ---------------------------------------------------------------------
+    % Legacy unordered pair cache only for optional residual cross-check
+    % ---------------------------------------------------------------------
+    if checkResidualAgainstLegacy
+        if useCallerGeomCache
+            pairCacheLegacy = scfParams.geom_cache;
+        else
+            cacheOpts = struct();
+            cacheOpts.site_mask = polMask;
+
+            if isfield(scfParams, 'rcut') && ~isempty(scfParams.rcut)
+                cacheOpts.rcut = scfParams.rcut;
+            else
+                cacheOpts.rcut = inf;
+            end
+
+            pairCacheLegacy = geom.build_nonperiodic_pair_cache(sys, cacheOpts);
+        end
+
+        dipoleParams = struct();
+        dipoleParams.exclude_self = true;
+        dipoleParams.softening = softening;
+        dipoleParams.target_mask = polMask;
+        dipoleParams.source_mask = polMask;
+        if isfield(scfParams, 'rcut') && ~isempty(scfParams.rcut)
+            dipoleParams.rcut = scfParams.rcut;
+        end
+        dipoleParams.geom_cache = pairCacheLegacy;
+    else
+        dipoleParams = struct(); %#ok<NASGU>
+    end
 
     mu = problem.mu0;
     mu_pol = mu(activeSites, :);
@@ -87,18 +152,6 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
     relresHistory = nan(maxIter, 1);
     converged = false;
 
-    % For residual checks, reuse the fast symmetric full-apply cache.
-    dipoleParams = struct();
-    dipoleParams.exclude_self = true;
-    dipoleParams.softening = softening;
-    dipoleParams.target_mask = polMask;
-    dipoleParams.source_mask = polMask;
-    if isfield(scfParams, 'rcut') && ~isempty(scfParams.rcut)
-        dipoleParams.rcut = scfParams.rcut;
-    end
-    dipoleParams.geom_cache = pairCache;
-
-    % Pull row-cache arrays locally once.
     row_ptr = rowCache.row_ptr;
     col_idx = rowCache.col_idx;
     dr_all  = rowCache.dr;
@@ -108,8 +161,6 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
         f3_all = rowCache.thole_f3;
         f5_all = rowCache.thole_f5;
     else
-        % This fallback should almost never be needed if pair cache was built
-        % from a normal polarization system.
         r_bare_all = rowCache.r_bare;
         alpha_full = sys.site_alpha(:);
         a = sys.thole_a;
@@ -147,8 +198,8 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
                 idx = k0:k1;
                 cols = col_idx(idx);
 
-                muNbr = mu_pol(cols, :);      % current in-place values: GS/SOR ordering handled naturally
-                dr    = dr_all(idx, :);       % directed r_j - r_i for target i <- source j
+                muNbr = mu_pol(cols, :);
+                dr    = dr_all(idx, :);
 
                 if useSoftening
                     r2 = r2_bare_all(idx) + softening^2;
@@ -164,7 +215,6 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
                     f3 = f3_all(idx);
                     f5 = f5_all(idx);
                 else
-                    % Rare fallback path
                     nNbr = numel(idx);
                     f3 = zeros(nNbr, 1);
                     f5 = zeros(nNbr, 1);
@@ -180,10 +230,10 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
 
                 muDotR = sum(muNbr .* dr, 2);
 
-                coeff1 = 3 .* (f5 .* muDotR .* invR5);   % nNbr x 1
-                coeff2 = (f3 .* invR3);                  % nNbr x 1
+                coeff1 = 3 .* (f5 .* muDotR .* invR5);
+                coeff2 = (f3 .* invR3);
 
-                contrib = coeff1 .* dr - coeff2 .* muNbr;   % nNbr x 3
+                contrib = coeff1 .* dr - coeff2 .* muNbr;
                 E_loc = E_loc + sum(contrib, 1);
             end
 
@@ -202,7 +252,20 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
                      (mod(iter, residualEvery) == 0);
 
         if doResidual
-            relres = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams);
+            relres = local_matrix_free_relres_rowcache(problem, mu_pol, Eext_pol, rowCache, softening, sys);
+
+            if checkResidualAgainstLegacy
+                relresLegacy = local_matrix_free_relres_legacy(sys, problem, mu, Eext, dipoleParams);
+                relDiff = abs(relres - relresLegacy) / max(1.0, abs(relresLegacy));
+
+                if relDiff > 1e-11
+                    error('thole:solve_scf_iterative_sor:ResidualMismatch', ...
+                        ['Row-cache residual and legacy residual disagree. ' ...
+                         'row=%.16e legacy=%.16e relDiff=%.3e'], ...
+                        relres, relresLegacy, relDiff);
+                end
+            end
+
             relresHistory(iter) = relres;
         else
             relres = NaN;
@@ -229,8 +292,19 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
 
         if converged
             if ~strcmp(stopMetric, "relres") && isnan(relres)
-                relres = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams);
+                relres = local_matrix_free_relres_rowcache(problem, mu_pol, Eext_pol, rowCache, softening, sys);
                 relresHistory(iter) = relres;
+
+                if checkResidualAgainstLegacy
+                    relresLegacy = local_matrix_free_relres_legacy(sys, problem, mu, Eext, dipoleParams);
+                    relDiff = abs(relres - relresLegacy) / max(1.0, abs(relresLegacy));
+                    if relDiff > 1e-11
+                        error('thole:solve_scf_iterative_sor:ResidualMismatch', ...
+                            ['Row-cache residual and legacy residual disagree. ' ...
+                             'row=%.16e legacy=%.16e relDiff=%.3e'], ...
+                            relres, relresLegacy, relDiff);
+                    end
+                end
 
                 if verbose
                     fprintf(' final relres = %.3e\n', relres);
@@ -253,7 +327,18 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
         relresHistory = relresHistory(1:maxIter);
 
         if isnan(relresHistory(end))
-            relresHistory(end) = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams);
+            relresHistory(end) = local_matrix_free_relres_rowcache(problem, mu_pol, Eext_pol, rowCache, softening, sys);
+
+            if checkResidualAgainstLegacy
+                relresLegacy = local_matrix_free_relres_legacy(sys, problem, mu, Eext, dipoleParams);
+                relDiff = abs(relresHistory(end) - relresLegacy) / max(1.0, abs(relresLegacy));
+                if relDiff > 1e-11
+                    error('thole:solve_scf_iterative_sor:ResidualMismatch', ...
+                        ['Row-cache residual and legacy residual disagree. ' ...
+                         'row=%.16e legacy=%.16e relDiff=%.3e'], ...
+                        relresHistory(end), relresLegacy, relDiff);
+                end
+            end
         end
 
         if verbose
@@ -281,7 +366,101 @@ function [mu, scf] = solve_scf_iterative_sor(sys, Eext, scfParams)
     scf.used_matrix_solver = false;
 end
 
-function relres = local_matrix_free_relres(sys, problem, mu, Eext, dipoleParams)
+function relres = local_matrix_free_relres_rowcache(problem, mu_pol, Eext_pol, rowCache, softening, sys)
+    alpha_pol = problem.alpha_pol(:);
+    nPolSites = problem.nPolSites;
+    activeSites = problem.activeSites(:);
+
+    row_ptr = rowCache.row_ptr;
+    col_idx = rowCache.col_idx;
+    dr_all  = rowCache.dr;
+
+    haveThole = isfield(rowCache, 'thole_f3') && isfield(rowCache, 'thole_f5');
+    if haveThole
+        f3_all = rowCache.thole_f3;
+        f5_all = rowCache.thole_f5;
+    else
+        r_bare_all = rowCache.r_bare;
+        alpha_full = sys.site_alpha(:);
+        a = sys.thole_a;
+    end
+
+    if softening == 0
+        useSoftening = false;
+        invR3_all = rowCache.inv_r3_bare;
+        invR5_all = rowCache.inv_r5_bare;
+        r2_bare_all = [];
+    else
+        useSoftening = true;
+        invR3_all = [];
+        invR5_all = [];
+        r2_bare_all = rowCache.r2_bare;
+    end
+
+    Edip_pol = zeros(nPolSites, 3);
+
+    for i = 1:nPolSites
+        k0 = row_ptr(i);
+        k1 = row_ptr(i + 1) - 1;
+
+        if k1 < k0
+            continue;
+        end
+
+        idx = k0:k1;
+        cols = col_idx(idx);
+
+        muNbr = mu_pol(cols, :);
+        dr    = dr_all(idx, :);
+
+        if useSoftening
+            r2 = r2_bare_all(idx) + softening^2;
+            invR = 1 ./ sqrt(r2);
+            invR3 = invR ./ r2;
+            invR5 = invR3 ./ r2;
+        else
+            invR3 = invR3_all(idx);
+            invR5 = invR5_all(idx);
+        end
+
+        if haveThole
+            f3 = f3_all(idx);
+            f5 = f5_all(idx);
+        else
+            nNbr = numel(idx);
+            f3 = zeros(nNbr, 1);
+            f5 = zeros(nNbr, 1);
+            iFull = activeSites(i);
+            jFull = activeSites(cols);
+            for kk = 1:nNbr
+                tf = thole.thole_f3f5_factors(r_bare_all(idx(kk)), ...
+                    alpha_full(iFull), alpha_full(jFull(kk)), a);
+                f3(kk) = tf.f3;
+                f5(kk) = tf.f5;
+            end
+        end
+
+        muDotR = sum(muNbr .* dr, 2);
+
+        coeff1 = 3 .* (f5 .* muDotR .* invR5);
+        coeff2 = (f3 .* invR3);
+
+        contrib = coeff1 .* dr - coeff2 .* muNbr;
+        Edip_pol(i, :) = sum(contrib, 1);
+    end
+
+    rhs_pol = alpha_pol .* (Eext_pol + Edip_pol);
+    r_pol = rhs_pol - mu_pol;
+
+    bn = norm(rhs_pol, 'fro');
+    if bn == 0
+        bn = 1.0;
+    end
+
+    relres = norm(r_pol, 'fro') / bn;
+end
+
+function relres = local_matrix_free_relres_legacy(sys, problem, mu, Eext, dipoleParams)
     polMask = problem.polMask;
     alpha   = problem.alpha;
 

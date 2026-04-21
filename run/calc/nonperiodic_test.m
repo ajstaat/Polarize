@@ -1,13 +1,38 @@
-%% run_test_nonperiodic_uniform_charged_pair_calc
+%% nonperiodic_real_crystal_example
+% Example: nonperiodic polarization calculation on a real charged-pair crystal.
+
 clear; clc; close all;
 
-rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
-filename   = fullfile(rootFolder, 'a_0.0_CONTCAR.vasp');
+fprintf('=== nonperiodic polarization energy (real crystal) ===\n');
+
+%% ------------------------------------------------------------------------
+% User controls
+
+cfg = struct();
+
+cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
+cfg.filename   = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
+
+cfg.supercellSize = [4 10 2];
+cfg.bondScale     = 1.20;
+
+cfg.pairCharges = [+1 -1];
+
+cfg.use_thole = true;
+cfg.verbose = true;
+cfg.softening = 0.0;
+
+cfg.nonperiodic = struct();
+cfg.nonperiodic.softening = 0.0;
+cfg.nonperiodic.use_thole = cfg.use_thole;
+cfg.nonperiodic.rcut = 18.0;
 
 %% ------------------------------------------------------------------------
 % Import crystal template
-crystal = io.import_contcar_as_crystal(filename, ...
-    'BondScale', 1.20, ...
+
+fprintf('\n[setup] importing crystal template...\n');
+crystal = io.import_contcar_as_crystal(cfg.filename, ...
+    'BondScale', cfg.bondScale, ...
     'WrapFractional', true, ...
     'SortMolecules', false);
 
@@ -16,12 +41,9 @@ fprintf('  nSites     = %d\n', size(crystal.cart_coords, 1));
 fprintf('  nBaseMols  = %d\n', numel(unique(crystal.base_mol_id)));
 
 %% ------------------------------------------------------------------------
-% Model with graph-based polarizability classes
-% Updated values:
-%   C_deg3      -> 1.334
-%   H_on_C_deg3 -> 0.496
-model = struct();
+% Model
 
+model = struct();
 model.polarizable_classes = { ...
     'H_on_C_deg3', ...
     'H_on_C_deg4', ...
@@ -40,260 +62,176 @@ model.alpha_by_class = struct( ...
 
 model.thole_a = 0.39;
 
-% Refactored run_polarization_calc interface for uniform molecular charges
-model.total_charges = [+1; -1];
+%% ------------------------------------------------------------------------
+% Build working system
+
+fprintf('\n[setup] building crystal system...\n');
+buildOpts = struct();
+buildOpts.supercell_size = cfg.supercellSize;
+buildOpts.bondScale      = cfg.bondScale;
+buildOpts.verbose        = cfg.verbose;
+buildOpts.removeMolIDs   = [];
+buildOpts.activeMolIDs   = [];
+
+sys0 = builder.make_crystal_system(crystal, model, buildOpts);
+
+fprintf('\nBuilt working system:\n');
+fprintf('  n_unit_sites = %d\n', sys0.n_unit_sites);
+fprintf('  n_cells      = %d\n', sys0.n_cells);
+fprintf('  n_sites      = %d\n', sys0.n_sites);
 
 %% ------------------------------------------------------------------------
-% Build-time / workflow options
-opts = struct();
-opts.supercell_size = [2 5 1];
-opts.bondScale = 1.20;
-opts.verbose = true;
-opts.removeMolIDs = [];
+% Automatically choose charged pair
 
-% Same-stack shell = 1 pair from your existing test
-refID = 32;
-nbrID = 38;
-opts.activeMolIDs = [refID nbrID];
+fprintf('\n[setup] choosing charged-pair molecules...\n');
+[refID, ~] = builder.choose_center_reference_molecule(sys0, ...
+    'RequireComplete', true, ...
+    'Verbose', cfg.verbose);
 
-% Charged molecules act as fixed field sources only
-opts.depolarizeActiveMolecules = true;
+desc = builder.complete_molecule_descriptors_relative_to_reference(sys0, refID, ...
+    'Verbose', cfg.verbose);
 
-fprintf('\nChosen pair:\n');
+sameStack = builder.select_same_stack_neighbor(desc, 1, ...
+    'Direction', 'either', ...
+    'Verbose', cfg.verbose);
+
+if isempty(sameStack.match_table) || height(sameStack.match_table) < 1
+    error('Automatic same-stack shell-1 neighbor selection failed.');
+end
+
+nbrID = sameStack.match_table.molecule_id(1);
+
+fprintf('\nChosen pair (automatic):\n');
 fprintf('  ref ID = %d\n', refID);
 fprintf('  nbr ID = %d\n', nbrID);
 
 %% ------------------------------------------------------------------------
-% Calculation parameters
-params = struct();
+% Apply charges and disable polarizability on charged molecules
 
-params.output = struct();
-params.output.verbose = true;
-params.output.computeEnergy = true;
-params.output.computeEnergyByMolecule = false;
-params.output.computeDipoleDipoleDecomp = false;
+fprintf('\n[setup] applying charges and extracting polarization system...\n');
+sys = builder.apply_molecule_charges(sys0, [refID nbrID], ...
+    'Mode', 'uniform', ...
+    'TotalCharges', cfg.pairCharges, ...
+    'SetActive', true, ...
+    'DisablePolarizabilityOnCharged', true, ...
+    'ZeroExistingCharges', true, ...
+    'Verbose', cfg.verbose);
 
-params.field = struct();
-params.field.include_external_charges = true;
-params.field.exclude_self = true;
-params.field.softening = 0.0;
+params_extract = struct();
+params_extract.ewald = struct();
+params_extract.ewald.mode = 'periodic';  % extraction-path consistency
 
-params.scf = struct();
-params.scf.solver = 'direct';
-params.scf.tol = 1e-10;
-params.scf.maxIter = 500;
-params.scf.mixing = 0.5;
-params.scf.omega = 1.0;
-params.scf.verbose = true;
-params.scf.printEvery = 25;
-params.scf.residualEvery = 25;
-params.scf.stopMetric = 'max_dmu';
-params.scf.use_thole = true;
-params.scf.softening = 0.0;
+polsys0 = builder.extract_polarization_system(sys, params_extract);
+io.assert_atomic_units(polsys0);
 
-params.ewald = struct();
-params.ewald.mode = 'nonperiodic';
+H0 = local_get_direct_lattice(polsys0);
+polsys = polsys0;
+polsys.super_lattice = H0;
 
-%% ------------------------------------------------------------------------
-% Run full nonperiodic polarization calculation
-result = calc.run_polarization_calc(crystal, model, opts, params);
+center0 = 0.5 * sum(H0, 2);
+center_per = 0.5 * sum(polsys.super_lattice, 2);
+shift = (center_per - center0).';
+polsys.site_pos = polsys0.site_pos + shift;
 
-sys    = result.sys;
-polsys = result.polsys;
-Eext   = result.Eext;
-Tpol   = result.Tpol;
-problem = result.problem;
-mu     = result.mu;
-energy = result.energy;
+fprintf('\nCanonical polarization system:\n');
+fprintf('  n_sites             = %d\n', polsys.n_sites);
+fprintf('  n_polarizable_sites = %d\n', nnz(polsys.site_is_polarizable));
+
+targetMask = logical(polsys.site_is_polarizable(:));
+sourceMask = abs(polsys.site_charge(:)) > 0;
+
+fprintf('\nMask summary:\n');
+fprintf('  n target sites (polarizable) = %d\n', nnz(targetMask));
+fprintf('  n source sites (charged)     = %d\n', nnz(sourceMask));
+fprintf('  total source charge          = %+0.12f\n', sum(polsys.site_charge(sourceMask)));
+fprintf('  max |source charge|          = %.12e\n', max(abs(polsys.site_charge(sourceMask))));
 
 %% ------------------------------------------------------------------------
-% Diagnostics on charged pair
-refIdx = builder.site_indices_for_molecule(sys, refID);
-nbrIdx = builder.site_indices_for_molecule(sys, nbrID);
+% Nonperiodic SOR controls
 
-fprintf('\nPost-run diagnostics:\n');
-fprintf('  ref site count                  = %d\n', numel(refIdx));
-fprintf('  nbr site count                  = %d\n', numel(nbrIdx));
-fprintf('  total system charge             = %+0.10f\n', sum(sys.site_charge));
-fprintf('  ref total charge                = %+0.10f\n', sum(sys.site_charge(refIdx)));
-fprintf('  nbr total charge                = %+0.10f\n', sum(sys.site_charge(nbrIdx)));
-fprintf('  ref polarizable sites remaining = %d\n', nnz(sys.site_is_polarizable(refIdx)));
-fprintf('  nbr polarizable sites remaining = %d\n', nnz(sys.site_is_polarizable(nbrIdx)));
-fprintf('  active sites total              = %d\n', nnz(sys.site_is_active));
-
-%% ------------------------------------------------------------------------
-% Assertions: charged pair setup
-if abs(sum(sys.site_charge(refIdx)) - 1.0) > 1e-12
-    error('Reference molecule charge assignment failed.');
-end
-
-if abs(sum(sys.site_charge(nbrIdx)) + 1.0) > 1e-12
-    error('Neighbor molecule charge assignment failed.');
-end
-
-if any(sys.site_is_polarizable(refIdx))
-    error('Reference molecule still has polarizable sites enabled.');
-end
-
-if any(sys.site_is_polarizable(nbrIdx))
-    error('Neighbor molecule still has polarizable sites enabled.');
-end
-
-if ~all(sys.site_is_active(refIdx)) || ~all(sys.site_is_active(nbrIdx))
-    error('Active mask was not set correctly on charged molecules.');
-end
+sorParams = struct();
+sorParams.use_thole = cfg.use_thole;
+sorParams.softening = cfg.softening;
+sorParams.verbose = true;
+sorParams.printEvery = 10;
+sorParams.residualEvery = 10;
+sorParams.tol = 1e-10;
+sorParams.maxIter = 500;
+sorParams.omega = 0.97;
+sorParams.stopMetric = 'relres';
+sorParams.rcut = cfg.nonperiodic.rcut;
+sorParams.checkResidualAgainstLegacy = false;
 
 %% ------------------------------------------------------------------------
-% Assertions: canonical polarization system
-io.assert_atomic_units(polsys);
+% NONPERIODIC run
+fprintf('\n============================================================\n');
+fprintf('NONPERIODIC\n');
+fprintf('============================================================\n');
 
-if ~strcmpi(polsys.units.length, 'bohr')
-    error('polsys length units are not bohr.');
-end
-if ~strcmpi(polsys.units.alpha, 'atomic_unit')
-    error('polsys alpha units are not atomic_unit.');
-end
-if ~strcmpi(polsys.units.charge, 'elementary_charge')
-    error('polsys charge units are not elementary_charge.');
-end
+params_nonper = struct();
+params_nonper.use_thole = cfg.use_thole;
+params_nonper.field = struct();
+params_nonper.field.mode = 'nonperiodic';
+params_nonper.field.exclude_self = true;
+params_nonper.field.use_thole_damping = cfg.use_thole;
+params_nonper.field.target_mask = targetMask;
+params_nonper.field.source_mask = sourceMask;
+% Intentionally no field rcut here: preserve old uncut external field.
+% Intentionally no field geom_cache here: use optimized direct evaluator.
 
-if size(polsys.site_pos, 1) ~= polsys.n_sites
-    error('polsys.site_pos row count mismatch.');
-end
+fprintf('[nonperiodic] building external field...\n');
+tField = tic;
+Eext = calc.compute_external_field(polsys, params_nonper);
+timeField = toc(tField);
+fprintf('[nonperiodic] external field done in %.6f s | ||Eext||_F = %.16e\n', ...
+    timeField, norm(Eext, 'fro'));
 
-if numel(polsys.site_alpha) ~= polsys.n_sites
-    error('polsys.site_alpha length mismatch.');
-end
+fprintf('[nonperiodic] preparing SCF problem...\n');
+tProblem = tic;
+problem = thole.prepare_scf_problem(polsys, Eext, sorParams);
+timeProblem = toc(tProblem);
+fprintf('[nonperiodic] problem prep done in %.6f s | nPolSites = %d\n', ...
+    timeProblem, problem.nPolSites);
 
-if numel(polsys.site_charge) ~= polsys.n_sites
-    error('polsys.site_charge length mismatch.');
-end
+fprintf('[nonperiodic] building solver row cache...\n');
+tRowCache = tic;
+rowOpts = struct();
+rowOpts.rcut = cfg.nonperiodic.rcut;
+solveRowCache = geom.build_active_row_cache_direct(polsys, problem, rowOpts);
+timeRowCache = toc(tRowCache);
+fprintf('[nonperiodic] solver row cache done in %.6f s | nPolSites = %d\n', ...
+    timeRowCache, solveRowCache.nPolSites);
 
-%% ------------------------------------------------------------------------
-% Assertions: external field / active-space setup
-if isempty(Eext)
-    error('Expected nonempty external field.');
-end
-
-if ~isequal(size(Eext), [polsys.n_sites, 3])
-    error('Eext must be N x 3.');
-end
-
-if any(~isfinite(Eext(:)))
-    error('Eext contains non-finite values.');
-end
-
-if problem.nSites ~= polsys.n_sites
-    error('problem.nSites does not match polsys.n_sites.');
-end
-
-if problem.nPolSites <= 0
-    error('Expected at least one polarizable site.');
+sorParams.row_cache = solveRowCache;
+if isfield(sorParams, 'geom_cache')
+    sorParams = rmfield(sorParams, 'geom_cache');
 end
 
-if numel(problem.activeSites) ~= problem.nPolSites
-    error('problem.activeSites length mismatch.');
+fprintf('[nonperiodic] solving matrix-free SOR...\n');
+tSolve = tic;
+[mu, iterInfo] = thole.solve_scf_iterative_sor(polsys, Eext, sorParams);
+timeSolve = toc(tSolve);
+fprintf('[nonperiodic] matrix-free SOR done in %.6f s | ||mu||_2 = %.16e\n', ...
+    timeSolve, norm(mu, 'fro'));
+fprintf('  converged = %d | nIter = %d | relres = %.16e\n', ...
+    iterInfo.converged, iterInfo.nIter, iterInfo.relres);
+
+polMask = logical(polsys.site_is_polarizable(:));
+E_total = -0.5 * sum(sum(mu(polMask, :) .* Eext(polMask, :)));
+fprintf('matrix-free total energy = %+0.12e Ha\n', E_total);
+
+fprintf('\nDone.\n');
+
+%% ========================================================================
+% Local helpers
+%% ========================================================================
+
+function H = local_get_direct_lattice(sys)
+    if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
+        H = sys.super_lattice;
+    elseif isfield(sys, 'lattice') && ~isempty(sys.lattice)
+        H = sys.lattice;
+    else
+        error('Missing direct lattice on system.');
+    end
 end
-
-if numel(problem.alpha_pol_vec) ~= 3 * problem.nPolSites
-    error('problem.alpha_pol_vec length mismatch.');
-end
-
-if numel(problem.Eext_pol_vec) ~= 3 * problem.nPolSites
-    error('problem.Eext_pol_vec length mismatch.');
-end
-
-%% ------------------------------------------------------------------------
-% Assertions: operator / induced dipoles
-if isempty(Tpol)
-    error('Expected nonempty Tpol.');
-end
-
-if ~isequal(size(Tpol), [3*problem.nPolSites, 3*problem.nPolSites])
-    error('Tpol size mismatch.');
-end
-
-if any(~isfinite(Tpol(:)))
-    error('Tpol contains non-finite values.');
-end
-
-if ~isequal(size(mu), [polsys.n_sites, 3])
-    error('mu must be N x 3.');
-end
-
-if any(~isfinite(mu(:)))
-    error('mu contains non-finite values.');
-end
-
-if ~isfield(result, 'direct') || ~isstruct(result.direct)
-    error('Missing direct-solver diagnostics.');
-end
-
-if ~isfield(result.direct, 'relres') || ~isfinite(result.direct.relres)
-    error('Direct-solver relres is missing or non-finite.');
-end
-
-if result.direct.relres > 1e-8
-    error('Direct-solver relres too large: %.3e', result.direct.relres);
-end
-
-relres_check = thole.compute_active_space_relres(problem, Tpol, mu);
-if ~isfinite(relres_check) || relres_check > 1e-8
-    error('Independent active-space residual too large: %.3e', relres_check);
-end
-
-%% ------------------------------------------------------------------------
-% Assertions: energy
-if ~isfield(energy, 'external_charge_dipole') || ~isfinite(energy.external_charge_dipole)
-    error('energy.external_charge_dipole must be finite.');
-end
-
-if ~isfield(energy, 'dipole_dipole') || ~isfinite(energy.dipole_dipole)
-    error('energy.dipole_dipole must be finite.');
-end
-
-if ~isfield(energy, 'total') || ~isfinite(energy.total)
-    error('energy.total must be finite.');
-end
-
-energy_check = calc.compute_total_energy_active_space( ...
-    polsys, problem, mu, Eext, Tpol);
-
-if abs(energy.total - energy_check.total) > 1e-12
-    error('Energy mismatch between stored and recomputed total.');
-end
-
-energy_total_eV = result.energy.total * 27.211386245988;
-
-%% ------------------------------------------------------------------------
-% Optional plot
-fig = figure(1);
-clf(fig);
-fig.Color = 'w';
-ax = axes('Parent', fig);
-
-viz.plot_supercell_selection(sys, ...
-    'ReferenceMolID', refID, ...
-    'NeighborMolID', nbrID, ...
-    'RequireCompleteRef', true, ...
-    'RequireCompleteNbr', true, ...
-    'IncompleteAction', 'error', ...
-    'EnvMarkerSize', 52, ...
-    'RefMarkerSize', 78, ...
-    'NbrMarkerSize', 78, ...
-    'ShowCOM', true, ...
-    'ShowLabels', true, ...
-    'DrawBox', true, ...
-    'Axes', ax, ...
-    'Title', sprintf('Nonperiodic charged pair: ref %d (+1), nbr %d (-1)', refID, nbrID));
-
-%% ------------------------------------------------------------------------
-% Report
-fprintf('\nCheckpoint passed.\n');
-fprintf('  polsys n_sites             = %d\n', polsys.n_sites);
-fprintf('  active polarizable sites   = %d\n', problem.nPolSites);
-fprintf('  total assigned charge      = %+0.10f\n', sum(polsys.site_charge));
-fprintf('  direct relres              = %.3e\n', result.direct.relres);
-fprintf('  total polarization energy  = %+0.10f\n', energy.total);
-fprintf('  total polarization energy  = %+0.10f eV\n', energy_total_eV);
-fprintf('run_nonperiodic_uniform_charged_pair_calc completed successfully.\n');

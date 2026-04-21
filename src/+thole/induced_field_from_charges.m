@@ -12,8 +12,7 @@ function E = induced_field_from_charges(sys, fieldParams)
 %                .rcut                   scalar cutoff in bohr, optional
 %                .target_mask            N x 1 logical, optional
 %                .source_mask            N x 1 logical, optional
-%                .geom_cache             optional bare-geometry cache from
-%                                        geom.build_nonperiodic_pair_cache
+%                .geom_cache             optional geometry cache
 %                .use_thole_damping      logical, default false
 %
 % Output
@@ -34,6 +33,11 @@ function E = induced_field_from_charges(sys, fieldParams)
 %   If rcut is supplied, only source-target pairs with bare separation
 %       |r_ij| <= rcut
 %   are included.
+%
+% Supported cache kinds
+%   1) legacy unordered all-pairs cache from geom.build_nonperiodic_pair_cache
+%   2) dedicated asymmetric target-source cache:
+%        cache.kind = 'target_source_field_cache'
 
     if nargin < 2 || isempty(fieldParams)
         fieldParams = struct();
@@ -145,20 +149,30 @@ function E = induced_field_from_charges(sys, fieldParams)
     end
 
     if ~isempty(geomCache)
-        E = local_apply_cached(q, alphaSites, tholeA, useThole, ...
-            geomCache, target_mask, source_mask, exclude_self, softening, rcut);
+        if isfield(geomCache, 'kind') && strcmp(geomCache.kind, 'target_source_field_cache')
+            E = local_apply_target_source_cache(q, alphaSites, tholeA, useThole, ...
+                geomCache, target_mask, source_mask, exclude_self, softening, rcut);
+        else
+            E = local_apply_cached_legacy(q, alphaSites, tholeA, useThole, ...
+                geomCache, target_mask, source_mask, exclude_self, softening, rcut);
+        end
         return;
     end
 
-    E = local_apply_direct(pos, q, alphaSites, tholeA, useThole, ...
+    E = local_apply_direct_vectorized(pos, q, alphaSites, tholeA, useThole, ...
         target_mask, source_mask, exclude_self, softening, rcut2);
 end
 
-function E = local_apply_cached(q, alphaSites, tholeA, useThole, ...
+function E = local_apply_target_source_cache(q, alphaSites, tholeA, useThole, ...
     cache, target_mask, source_mask, exclude_self, softening, rcut)
 
     nSites = cache.nSites;
     E = zeros(nSites, 3);
+
+    if ~isfield(cache, 'mode') || ~strcmp(cache.mode, 'nonperiodic')
+        error('calc:induced_field_from_charges:BadTargetSourceCacheMode', ...
+            'target_source_field_cache must have mode = ''nonperiodic''.');
+    end
 
     if ~isempty(rcut)
         if ~isfield(cache, 'rcut') || isempty(cache.rcut) || isinf(cache.rcut) || cache.rcut + 1e-12 < rcut
@@ -167,38 +181,43 @@ function E = local_apply_cached(q, alphaSites, tholeA, useThole, ...
         end
     end
 
-    if exclude_self && isequal(target_mask, source_mask)
-        E = local_apply_cached_symmetric(E, q, alphaSites, tholeA, useThole, ...
-            cache, target_mask, softening);
-    else
-        E = local_apply_cached_masked(E, q, alphaSites, tholeA, useThole, ...
-            cache, target_mask, source_mask, softening, exclude_self);
+    if isfield(cache, 'exclude_self') && logical(cache.exclude_self) ~= logical(exclude_self)
+        error('calc:induced_field_from_charges:ExcludeSelfMismatch', ...
+            'fieldParams.geom_cache.exclude_self does not match request.');
     end
-end
 
-function E = local_apply_cached_symmetric(E, q, alphaSites, tholeA, useThole, ...
-    cache, mask, softening)
-% Fast path for equal target/source masks with self excluded.
-% Uses unordered pair symmetry: pair (i,j) updates both i and j.
-
-    pair_i = cache.pair_i;
-    pair_j = cache.pair_j;
+    pair_i = cache.pair_target_full(:);
+    pair_j = cache.pair_source_full(:);
     dr     = cache.dr;
-    r2Bare = cache.r2_bare;
+    r2Bare = cache.r2_bare(:);
 
-    usePair = mask(pair_i) & mask(pair_j);
+    keep = target_mask(pair_i) & source_mask(pair_j);
 
-    if ~any(usePair)
+    if ~any(keep)
         return;
     end
 
-    pair_i = pair_i(usePair);
-    pair_j = pair_j(usePair);
-    dr     = dr(usePair, :);
-    r2Bare = r2Bare(usePair);
+    pair_i = pair_i(keep);
+    pair_j = pair_j(keep);
+    dr     = dr(keep, :);
+    r2Bare = r2Bare(keep);
+
+    qj = q(pair_j);
+    keepq = (qj ~= 0);
+
+    if ~any(keepq)
+        return;
+    end
+
+    pair_i = pair_i(keepq);
+    pair_j = pair_j(keepq);
+    dr     = dr(keepq, :);
+    r2Bare = r2Bare(keepq);
+    qj     = qj(keepq);
 
     if softening == 0
-        invR3 = cache.inv_r3_bare(usePair);
+        invR3 = cache.inv_r3_bare(keep);
+        invR3 = invR3(keepq);
     else
         r2 = r2Bare + softening^2;
         invR = 1 ./ sqrt(r2);
@@ -207,7 +226,8 @@ function E = local_apply_cached_symmetric(E, q, alphaSites, tholeA, useThole, ..
 
     if useThole
         if softening == 0 && isfield(cache, 'thole_f3') && ~isempty(cache.thole_f3)
-            f3 = cache.thole_f3(usePair);
+            f3 = cache.thole_f3(keep);
+            f3 = f3(keepq);
         else
             nPairsLocal = numel(pair_i);
             f3 = zeros(nPairsLocal, 1);
@@ -222,44 +242,40 @@ function E = local_apply_cached_symmetric(E, q, alphaSites, tholeA, useThole, ..
         invR3 = invR3 .* f3;
     end
 
-    nPairs = numel(pair_i);
+    coeff = qj .* invR3;
+    contrib = (-dr) .* coeff;
 
-    for p = 1:nPairs
-        i = pair_i(p);
-        j = pair_j(p);
+    E(:, 1) = accumarray(pair_i, contrib(:, 1), [nSites, 1], @sum, 0);
+    E(:, 2) = accumarray(pair_i, contrib(:, 2), [nSites, 1], @sum, 0);
+    E(:, 3) = accumarray(pair_i, contrib(:, 3), [nSites, 1], @sum, 0);
 
-        qi = q(i);
-        qj = q(j);
-
-        if qi == 0 && qj == 0
-            continue;
-        end
-
-        rij = dr(p, :);  % r_j - r_i
-
-        % Field at i from charge on j uses r_i - r_j = -rij
-        if qj ~= 0
-            E(i, :) = E(i, :) + qj * (-rij) * invR3(p);
-        end
-
-        % Field at j from charge on i uses r_j - r_i = +rij
-        if qi ~= 0
-            E(j, :) = E(j, :) + qi * rij * invR3(p);
-        end
+    if ~exclude_self
+        warning('calc:induced_field_from_charges:SelfNotCached', ...
+            ['exclude_self = false requested with target-source cache, but self terms are ', ...
+             'not represented unless explicitly included in the cache.']);
     end
 end
 
-function E = local_apply_cached_masked(E, q, alphaSites, tholeA, useThole, ...
-    cache, target_mask, source_mask, softening, exclude_self)
-% General masked cached path.
+function E = local_apply_cached_legacy(q, alphaSites, tholeA, useThole, ...
+    cache, target_mask, source_mask, exclude_self, softening, rcut)
 
-    pair_i = cache.pair_i;
-    pair_j = cache.pair_j;
+    nSites = cache.nSites;
+    E = zeros(nSites, 3);
+
+    if ~isempty(rcut)
+        if ~isfield(cache, 'rcut') || isempty(cache.rcut) || isinf(cache.rcut) || cache.rcut + 1e-12 < rcut
+            error('calc:induced_field_from_charges:CacheTooSmall', ...
+                'fieldParams.geom_cache does not cover the requested rcut.');
+        end
+    end
+
+    pair_i = cache.pair_i(:);
+    pair_j = cache.pair_j(:);
     dr     = cache.dr;
-    r2Bare = cache.r2_bare;
+    r2Bare = cache.r2_bare(:);
 
     if softening == 0
-        invR3 = cache.inv_r3_bare;
+        invR3 = cache.inv_r3_bare(:);
     else
         r2 = r2Bare + softening^2;
         invR = 1 ./ sqrt(r2);
@@ -268,7 +284,7 @@ function E = local_apply_cached_masked(E, q, alphaSites, tholeA, useThole, ...
 
     if useThole
         if softening == 0 && isfield(cache, 'thole_f3') && ~isempty(cache.thole_f3)
-            f3 = cache.thole_f3;
+            f3 = cache.thole_f3(:);
         else
             nPairsLocal = numel(pair_i);
             f3 = zeros(nPairsLocal, 1);
@@ -312,57 +328,86 @@ function E = local_apply_cached_masked(E, q, alphaSites, tholeA, useThole, ...
     end
 end
 
-function E = local_apply_direct(pos, q, alphaSites, tholeA, useThole, ...
+function E = local_apply_direct_vectorized(pos, q, alphaSites, tholeA, useThole, ...
     target_mask, source_mask, exclude_self, softening, rcut2)
 
     nSites = size(pos, 1);
     E = zeros(nSites, 3);
 
     targetIdx = find(target_mask);
-    sourceIdx = find(source_mask);
+    if isempty(targetIdx)
+        return;
+    end
 
-    for a = 1:numel(targetIdx)
-        i = targetIdx(a);
+    % Only nonzero charges matter.
+    sourceIdx = find(source_mask & (q ~= 0));
+    if isempty(sourceIdx)
+        return;
+    end
 
-        ri = pos(i, :);
-        Ei = [0, 0, 0];
+    targetPos = pos(targetIdx, :);
+    Ework = zeros(numel(targetIdx), 3);
 
-        for b = 1:numel(sourceIdx)
-            j = sourceIdx(b);
+    for b = 1:numel(sourceIdx)
+        j = sourceIdx(b);
+        qj = q(j);
+        rj = pos(j, :);
 
-            if exclude_self && i == j
-                continue;
-            end
+        % r_ij = r_i - r_j for all targets
+        rij = targetPos - rj;               % nTarget x 3
+        r2_bare = sum(rij.^2, 2);          % nTarget x 1
 
-            qj = q(j);
-            if qj == 0
-                continue;
-            end
+        keep = true(numel(targetIdx), 1);
 
-            rij = ri - pos(j, :);
-            r2_bare = dot(rij, rij);
-
-            if r2_bare > rcut2
-                continue;
-            end
-
-            r2 = r2_bare + softening^2;
-
-            if r2 == 0
-                continue;
-            end
-
-            invR3 = 1 / (r2^(3/2));
-
-            if useThole
-                rBare = sqrt(r2_bare);
-                tf = thole.thole_f3f5_factors(rBare, alphaSites(i), alphaSites(j), tholeA);
-                invR3 = invR3 * tf.f3;
-            end
-
-            Ei = Ei + qj * rij * invR3;
+        if exclude_self
+            keep = keep & (targetIdx ~= j);
         end
 
-        E(i, :) = Ei;
+        if isfinite(rcut2)
+            keep = keep & (r2_bare <= rcut2);
+        end
+
+        if ~any(keep)
+            continue;
+        end
+
+        rij_keep = rij(keep, :);
+        r2_bare_keep = r2_bare(keep);
+
+        r2 = r2_bare_keep + softening^2;
+
+        nonzero = (r2 > 0);
+        if ~all(nonzero)
+            rij_keep = rij_keep(nonzero, :);
+            r2_bare_keep = r2_bare_keep(nonzero);
+            keepIdx = find(keep);
+            keepIdx = keepIdx(nonzero);
+        else
+            keepIdx = find(keep);
+        end
+
+        if isempty(keepIdx)
+            continue;
+        end
+
+        invR = 1 ./ sqrt(r2_bare_keep + softening^2);
+        invR3 = invR ./ (r2_bare_keep + softening^2);
+
+        if useThole
+            f3 = zeros(numel(keepIdx), 1);
+            rBare = sqrt(r2_bare_keep);
+            alpha_j = alphaSites(j);
+            tgtFull = targetIdx(keepIdx);
+            for k = 1:numel(keepIdx)
+                i = tgtFull(k);
+                tf = thole.thole_f3f5_factors(rBare(k), alphaSites(i), alpha_j, tholeA);
+                f3(k) = tf.f3;
+            end
+            invR3 = invR3 .* f3;
+        end
+
+        Ework(keepIdx, :) = Ework(keepIdx, :) + qj .* rij_keep .* invR3;
     end
+
+    E(targetIdx, :) = Ework;
 end
