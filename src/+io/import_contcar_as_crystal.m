@@ -29,11 +29,13 @@ function crystal = import_contcar_as_crystal(filename, varargin)
 
     % Unit-cell PBC bond graph
     [A_unit, ~] = io.build_pbc_bond_graph(S.species, S.frac, S.lattice, opts.BondScale);
-
-    % Identify molecules in the UNIT CELL for template/provenance purposes
+    
+    % Identify molecules in the UNIT CELL for template/provenance purposes.
+    % Reuse the already-built unit-cell bond graph to avoid rebuilding it.
     molecules = io.unwrap_all_contcar_molecules(S, ...
         'BondScale', opts.BondScale, ...
-        'SortMolecules', opts.SortMolecules);
+        'SortMolecules', opts.SortMolecules, ...
+        'BondGraph', A_unit);
 
     nSites = size(S.frac, 1);
     base_mol_id = zeros(nSites, 1);

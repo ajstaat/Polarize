@@ -155,10 +155,10 @@ sorParams.softening = cfg.softening;
 sorParams.verbose = true;
 sorParams.printEvery = 10;
 sorParams.residualEvery = 10;
-sorParams.tol = 1e-10;
+sorParams.tol = 1e-6;
 sorParams.maxIter = 500;
 sorParams.omega = 0.97;
-sorParams.stopMetric = 'relres';
+sorParams.stopMetric = 'max_dmu';
 sorParams.rcut = cfg.nonperiodic.rcut;
 sorParams.checkResidualAgainstLegacy = false;
 

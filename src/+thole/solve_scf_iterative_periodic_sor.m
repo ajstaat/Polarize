@@ -38,17 +38,6 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 % Output
 %   mu          N x 3 induced dipoles
 %   scf         convergence metadata
-%
-% Notes
-%   - The periodic operator is split as:
-%       T = Treal + Trecip + Tself + Tsurf
-%   - The local diagonal block used in the implicit site solve is:
-%       D_i = Dreal_diag(i) + Drecip_diag + Dself + Dsurf
-%   - The reciprocal-space cache supports:
-%       * full mode    : precomputed cos/sin phase tables
-%       * chunked mode : on-the-fly k-block phase evaluation
-%   - The analytic self term sign here is positive, to match the assembled
-%     periodic operator convention already validated against direct solves.
 
     if nargin < 4 || isempty(scfParams)
         scfParams = struct();
@@ -111,23 +100,29 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
     % ---------------------------------------------------------------------
     % Build or reuse caches
-
-    cacheParams = struct();
-    cacheParams.use_thole = use_thole;
-    cacheParams.verbose = verbose;
-
-    if isfield(scfParams, 'realspace_cache') && ~isempty(scfParams.realspace_cache)
-        realCache = scfParams.realspace_cache;
-    else
-        realCache = geom.build_periodic_realspace_cache(sys, problem, ewaldParams, cacheParams);
+    
+    use_thole = true;
+    if isfield(scfParams, 'use_thole') && ~isempty(scfParams.use_thole)
+        use_thole = logical(scfParams.use_thole);
     end
-
-    if isfield(scfParams, 'realspace_row_cache') && ~isempty(scfParams.realspace_row_cache)
+    
+    rowCache = [];
+    realCache = [];
+    
+    if isfield(scfParams, 'realspace_dipole_row_cache') && ~isempty(scfParams.realspace_dipole_row_cache)
+        rowCache = scfParams.realspace_dipole_row_cache;
+    elseif isfield(scfParams, 'realspace_row_cache') && ~isempty(scfParams.realspace_row_cache)
         rowCache = scfParams.realspace_row_cache;
     else
-        rowCache = geom.build_periodic_realspace_row_cache(sys, problem, realCache);
+        rowCache = geom.build_periodic_realspace_dipole_row_cache(sys, problem, ewaldParams, scfParams);
     end
-
+    
+    % Legacy realCache is only needed if someone explicitly provided it
+    % and you want to keep it around for diagnostics.
+    if isfield(scfParams, 'realspace_cache') && ~isempty(scfParams.realspace_cache)
+        realCache = scfParams.realspace_cache;
+    end
+    
     if isfield(scfParams, 'kspace_cache') && ~isempty(scfParams.kspace_cache)
         kCache = scfParams.kspace_cache;
     else
@@ -235,9 +230,6 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
     % ---------------------------------------------------------------------
     % Initialize reciprocal source sums
-    %
-    % A(k) = sum_j cos_j(k) * (k·mu_j)
-    % B(k) = sum_j sin_j(k) * (k·mu_j)
 
     if nk > 0
         switch kCache.storage_mode
@@ -288,9 +280,15 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
     converged = false;
 
     if verbose
+        if ~isempty(realCache)
+            nRealPrint = realCache.nInteractions;
+        else
+            nRealPrint = rowCache.nInteractions;
+        end
+        
         fprintf(['SCF(iterative, periodic matrix-free SOR): tol=%.3e, maxIter=%d, omega=%.3f' ...
                  ' | nReal=%d | nK=%d\n'], ...
-            tol, maxIter, omega, realCache.nInteractions, kCache.num_kvec);
+            tol, maxIter, omega, nRealPrint, kCache.num_kvec);
     end
 
     tSCF = tic;
@@ -378,7 +376,6 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
             E_full = Eext_pol(i, :) + E_real + E_recip + E_self + E_surf;
 
-            % Split off the local diagonal contribution
             Dii = Ddiag(:, :, i);
             E_off = E_full - (Dii * mui_current.').';
 
@@ -441,7 +438,7 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
             dipoleParams.problem = problem;
             dipoleParams.target_mask = polMask;
             dipoleParams.source_mask = polMask;
-            dipoleParams.realspace_cache = realCache;
+            dipoleParams.realspace_row_cache = rowCache;
             dipoleParams.kspace_cache = kCache;
 
             Edip = thole.induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, dipoleParams);
@@ -486,7 +483,7 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
                 dipoleParams.problem = problem;
                 dipoleParams.target_mask = polMask;
                 dipoleParams.source_mask = polMask;
-                dipoleParams.realspace_cache = realCache;
+                dipoleParams.realspace_row_cache = rowCache;
                 dipoleParams.kspace_cache = kCache;
 
                 Edip = thole.induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, dipoleParams);
@@ -526,7 +523,7 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
             dipoleParams.problem = problem;
             dipoleParams.target_mask = polMask;
             dipoleParams.source_mask = polMask;
-            dipoleParams.realspace_cache = realCache;
+            dipoleParams.realspace_row_cache = rowCache;
             dipoleParams.kspace_cache = kCache;
 
             Edip = thole.induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, dipoleParams);

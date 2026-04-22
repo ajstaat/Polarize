@@ -8,6 +8,12 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
 %   - symmetric unordered dipole-style geometry caches
 %   - directed rectangular target/source charge-style geometry caches
 %
+% Fast path:
+%   - uses mex_build_periodic_realspace_row_geom_cache when available
+%
+% Fallback:
+%   - preserves the uploaded MATLAB implementation structure
+%
 % Output fields
 %   .mode
 %   .nSites
@@ -54,6 +60,54 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
     nTargetSites = numel(targetSites);
     nSourceSites = numel(sourceSites);
 
+    mexAvailable = (exist(['mex_build_periodic_realspace_row_geom_cache.' mexext], 'file') == 3) || ...
+                   (exist('mex_build_periodic_realspace_row_geom_cache', 'file') == 3);
+
+    if mexAvailable
+        [row_ptr, col_idx, source_full_idx, dr, r_bare, r2_bare, ...
+            fullToTarget, fullToSource, nDirected] = ...
+            mex_build_periodic_realspace_row_geom_cache( ...
+                double(problem.nSites), ...
+                double(targetSites), ...
+                double(sourceSites), ...
+                double(geomCache.pair_i(:)), ...
+                double(geomCache.pair_j(:)), ...
+                double(geomCache.dr), ...
+                double(geomCache.r_bare(:)), ...
+                double(geomCache.r2_bare(:)), ...
+                double(isfield(geomCache, 'is_symmetric_pair_cache') && geomCache.is_symmetric_pair_cache));
+
+        rowCache = struct();
+        rowCache.mode = 'periodic_realspace_row_geom';
+        rowCache.nSites = nSites;
+        rowCache.nTargetSites = nTargetSites;
+        rowCache.nSourceSites = nSourceSites;
+        rowCache.nPolSites = nTargetSites;
+
+        rowCache.targetSites = targetSites;
+        rowCache.sourceSites = sourceSites;
+        rowCache.activeSites = targetSites;
+
+        rowCache.full_to_target = fullToTarget;
+        rowCache.full_to_active = fullToTarget;
+        rowCache.full_to_source = fullToSource;
+
+        rowCache.row_ptr = row_ptr;
+        rowCache.col_idx = col_idx;
+        rowCache.source_full_idx = source_full_idx;
+
+        rowCache.dr = dr;
+        rowCache.r_bare = r_bare;
+        rowCache.r2_bare = r2_bare;
+
+        rowCache.rcut = geomCache.rcut;
+        rowCache.nInteractions = nDirected;
+        return;
+    end
+
+    % ---------------------------------------------------------------------
+    % MATLAB fallback: preserve uploaded implementation structure
+
     fullToTarget = zeros(nSites, 1);
     fullToTarget(targetSites) = 1:nTargetSites;
 
@@ -76,7 +130,7 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
         rowCache.nSites = nSites;
         rowCache.nTargetSites = nTargetSites;
         rowCache.nSourceSites = nSourceSites;
-        rowCache.nPolSites = nTargetSites; % backward compatibility
+        rowCache.nPolSites = nTargetSites;
         rowCache.targetSites = targetSites;
         rowCache.sourceSites = sourceSites;
         rowCache.activeSites = targetSites;
@@ -106,7 +160,6 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
     isSymmetric = isfield(geomCache, 'is_symmetric_pair_cache') && geomCache.is_symmetric_pair_cache;
 
     if isSymmetric
-        % Expand unordered cache into directed row entries.
         nEntries = numel(ti);
         isSelf = (pair_i_full == pair_j_full);
         nDirected = 2 * nnz(~isSelf) + nnz(isSelf);
@@ -130,7 +183,6 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
                 r_bare(idx) = r_bare_pair(p);
                 r2_bare(idx) = r2_bare_pair(p);
             else
-                % i <- j
                 idx = idx + 1;
                 row_idx(idx) = ti(p);
                 col_idx(idx) = sj(p);
@@ -140,7 +192,6 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
                 r_bare(idx) = r_bare_pair(p);
                 r2_bare(idx) = r2_bare_pair(p);
 
-                % j <- i
                 idx = idx + 1;
                 row_idx(idx) = fullToTarget(pair_j_full(p));
                 col_idx(idx) = fullToSource(pair_i_full(p));
@@ -153,7 +204,6 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
         end
 
     else
-        % Already directed target <- source geometry.
         nDirected = numel(ti);
 
         row_idx = ti;
@@ -187,14 +237,14 @@ function rowCache = build_periodic_realspace_row_geom_cache(sys, problem, geomCa
     rowCache.nSites = nSites;
     rowCache.nTargetSites = nTargetSites;
     rowCache.nSourceSites = nSourceSites;
-    rowCache.nPolSites = nTargetSites; % backward compatibility
+    rowCache.nPolSites = nTargetSites;
 
     rowCache.targetSites = targetSites;
     rowCache.sourceSites = sourceSites;
-    rowCache.activeSites = targetSites; % backward compatibility
+    rowCache.activeSites = targetSites;
 
     rowCache.full_to_target = fullToTarget;
-    rowCache.full_to_active = fullToTarget; % backward compatibility
+    rowCache.full_to_active = fullToTarget;
     rowCache.full_to_source = fullToSource;
 
     rowCache.row_ptr = row_ptr;

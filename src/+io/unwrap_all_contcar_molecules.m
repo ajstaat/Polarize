@@ -15,6 +15,9 @@ function molecules = unwrap_all_contcar_molecules(inputStructOrFilename, varargi
 % Optional name-value inputs
 %   'BondScale'     : scalar, default 1.20
 %   'SortMolecules' : logical, default false
+%   'BondGraph'     : optional N x N logical adjacency matrix for the
+%                     UNIT-CELL PBC bond graph. If provided, bypasses
+%                     internal build_pbc_bond_graph call.
 %
 % Output
 %   molecules{k} is a struct with fields:
@@ -36,6 +39,8 @@ function molecules = unwrap_all_contcar_molecules(inputStructOrFilename, varargi
         (ischar(x) || isstring(x)) || isstruct(x));
     addParameter(p, 'BondScale', 1.20, @(x) isnumeric(x) && isscalar(x) && x > 0);
     addParameter(p, 'SortMolecules', false, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'BondGraph', [], @(x) isempty(x) || ...
+        (islogical(x) && ismatrix(x) && size(x,1) == size(x,2)));
     parse(p, inputStructOrFilename, varargin{:});
     opt = p.Results;
 
@@ -65,10 +70,29 @@ function molecules = unwrap_all_contcar_molecules(inputStructOrFilename, varargi
     S.frac = S.frac - floor(S.frac);
     S.cart = S.frac * S.lattice;
 
+    n = size(S.frac, 1);
+
     % -------------------------------------------------------------
     % PBC-aware molecule identification on the UNIT CELL
     % -------------------------------------------------------------
-    [A, ~] = io.build_pbc_bond_graph(S.species, S.frac, S.lattice, opt.BondScale);
+    if isempty(opt.BondGraph)
+        [A, ~] = io.build_pbc_bond_graph(S.species, S.frac, S.lattice, opt.BondScale);
+    else
+        A = opt.BondGraph;
+
+        if ~isequal(size(A), [n n])
+            error('io:unwrap_all_contcar_molecules:BadBondGraphSize', ...
+                'BondGraph must be %d x %d to match the unit-cell site count.', n, n);
+        end
+        if ~isequal(A, A.')
+            error('io:unwrap_all_contcar_molecules:BondGraphNotSymmetric', ...
+                'BondGraph must be symmetric.');
+        end
+        if any(diag(A))
+            error('io:unwrap_all_contcar_molecules:BondGraphBadDiagonal', ...
+                'BondGraph diagonal must be false.');
+        end
+    end
 
     componentID = conncomp(graph(A)).';
     molIDs = unique(componentID, 'stable');

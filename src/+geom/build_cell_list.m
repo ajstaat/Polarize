@@ -16,6 +16,11 @@ function spatial = build_cell_list(pos, opts)
 %                      from cutoff
 %          .store_frac logical, default true for periodic
 %
+%          .prefer_reach_one    logical, default true for periodic,
+%                               false for nonperiodic
+%          .directional_pruning logical, default true for both periodic
+%                               and nonperiodic
+%
 % Output
 %   spatial : struct describing a cell-list index and compatible with
 %             geom.query_pairs_cell_list(...)
@@ -33,6 +38,17 @@ cellMat    = local_get_opt(opts, 'cell', []);
 cutoff     = local_get_opt(opts, 'cutoff', []);
 binSizeIn  = local_get_opt(opts, 'bin_size', []);
 storeFrac  = local_get_opt(opts, 'store_frac', true);
+
+preferReachOne     = local_get_opt(opts, 'prefer_reach_one', []);
+directionalPruning = local_get_opt(opts, 'directional_pruning', []);
+nonperiodicBinScale = local_get_opt(opts, 'nonperiodic_bin_scale', 0.25);
+
+if isempty(preferReachOne)
+    preferReachOne = isPeriodic;
+end
+if isempty(directionalPruning)
+    directionalPruning = true;
+end
 
 if isempty(cutoff) || ~(isscalar(cutoff) && isfinite(cutoff) && cutoff > 0)
     error('geom:build_cell_list:BadCutoff', ...
@@ -81,13 +97,41 @@ if n == 0
 end
 
 if isPeriodic
-    % Convert to fractional coordinates and wrap to [0,1).
+    % -------------------------------------------------------------
+    % Periodic branch: fractional coordinates, wrapped to [0,1)
+    % -------------------------------------------------------------
     frac = (invCell * pos.').';
     frac = frac - floor(frac);
 
+    L = [norm(cellMat(:,1)), norm(cellMat(:,2)), norm(cellMat(:,3))];
+
     if isempty(binSizeIn)
-        L = [norm(cellMat(:,1)), norm(cellMat(:,2)), norm(cellMat(:,3))];
-        gridShape = max(ones(1,3), ceil(L ./ cutoff));
+        baseBinSize = [cutoff cutoff cutoff];
+
+        if preferReachOne
+            candidateFactors = [1.00, 1.02, 1.05, 1.07, 1.10, 1.12, 1.15];
+            chosenGridShape = [];
+
+            for f = candidateFactors
+                trialBinSize = f * baseBinSize;
+                trialGridShape = local_periodic_grid_shape_from_bin_size(L, trialBinSize);
+                trialBinSizeCart = L .* (1 ./ trialGridShape);
+                trialReach = local_periodic_reach_from_bin_size(cutoff, trialBinSizeCart);
+
+                if all(trialReach == [1 1 1])
+                    chosenGridShape = trialGridShape;
+                    break;
+                end
+            end
+
+            if isempty(chosenGridShape)
+                gridShape = local_periodic_grid_shape_from_bin_size(L, baseBinSize);
+            else
+                gridShape = chosenGridShape;
+            end
+        else
+            gridShape = local_periodic_grid_shape_from_bin_size(L, baseBinSize);
+        end
     else
         if isscalar(binSizeIn)
             binSizeIn = [binSizeIn binSizeIn binSizeIn];
@@ -95,16 +139,14 @@ if isPeriodic
         validateattributes(binSizeIn, {'double'}, ...
             {'vector', 'numel', 3, 'positive', 'finite', 'real'}, ...
             mfilename, 'opts.bin_size');
-        L = [norm(cellMat(:,1)), norm(cellMat(:,2)), norm(cellMat(:,3))];
-        gridShape = max(ones(1,3), ceil(L ./ binSizeIn(:).'));
+
+        gridShape = local_periodic_grid_shape_from_bin_size(L, binSizeIn(:).');
     end
 
     binSizeFrac = 1 ./ gridShape;
-    binSizeCart = [norm(cellMat(:,1))*binSizeFrac(1), ...
-                   norm(cellMat(:,2))*binSizeFrac(2), ...
-                   norm(cellMat(:,3))*binSizeFrac(3)];
+    binSizeCart = L .* binSizeFrac;
 
-    reach = max([1 1 1], ceil(cutoff ./ binSizeCart));
+    reach = local_periodic_reach_from_bin_size(cutoff, binSizeCart);
 
     ijk = floor(frac .* gridShape) + 1;
     ijk = min(max(ijk, 1), gridShape);
@@ -114,13 +156,18 @@ if isPeriodic
     else
         spatial.frac = [];
     end
+
+    spatial.bin_size = binSizeFrac;
 else
+    % -------------------------------------------------------------
+    % Nonperiodic branch: Cartesian bounding-box binning
+    % -------------------------------------------------------------
     xyzMin = min(pos, [], 1);
     xyzMax = max(pos, [], 1);
     extents = max(xyzMax - xyzMin, 0);
 
     if isempty(binSizeIn)
-        binSize = [cutoff cutoff cutoff];
+        binSize = nonperiodicBinScale * [cutoff cutoff cutoff];
     else
         if isscalar(binSizeIn)
             binSizeIn = [binSizeIn binSizeIn binSizeIn];
@@ -143,6 +190,7 @@ else
 
     spatial.frac = [];
     spatial.xyz_min = xyzMin;
+    spatial.bin_size = binSize;
 end
 
 lin = local_linearize_sub(ijk, gridShape);
@@ -157,13 +205,16 @@ for p = n:-1:1
     binHead(b) = p;
 end
 
-offsets = local_neighbor_offsets(reach);
-
-if isPeriodic
-    spatial.bin_size = binSizeFrac;
+if directionalPruning
+    if isPeriodic
+        offsets = local_directional_periodic_offsets(cellMat, gridShape, cutoff, reach);
+    else
+        offsets = local_directional_nonperiodic_offsets(spatial.bin_size, cutoff, reach);
+    end
 else
-    spatial.bin_size = binSize;
+    offsets = local_neighbor_offsets(reach);
 end
+
 spatial.grid_shape = gridShape;
 spatial.n_bins = nBins;
 spatial.point_bin = lin;
@@ -172,6 +223,132 @@ spatial.bin_next = binNext;
 spatial.neighbor_offsets = offsets;
 spatial.search_reach = reach;
 
+end
+
+function gridShape = local_periodic_grid_shape_from_bin_size(L, binSize)
+gridShape = max(ones(1,3), ceil(L ./ binSize));
+end
+
+function reach = local_periodic_reach_from_bin_size(cutoff, binSizeCart)
+reach = max([1 1 1], ceil(cutoff ./ binSizeCart));
+end
+
+function offsets = local_directional_periodic_offsets(cellMat, gridShape, cutoff, reach)
+rx = reach(1);
+ry = reach(2);
+rz = reach(3);
+
+buf = zeros((2*rx+1)*(2*ry+1)*(2*rz+1), 3);
+k = 0;
+
+for dx = -rx:rx
+    for dy = -ry:ry
+        for dz = -rz:rz
+            if ~local_keep_half_offset(dx,dy,dz)
+                continue;
+            end
+            if local_keep_offset_directional_periodic(cellMat, gridShape, [dx dy dz], cutoff)
+                k = k + 1;
+                buf(k,:) = [dx dy dz];
+            end
+        end
+    end
+end
+
+offsets = buf(1:k, :);
+end
+
+function keep = local_keep_offset_directional_periodic(cellMat, gridShape, dxyz, cutoff)
+nx = gridShape(1);
+ny = gridShape(2);
+nz = gridShape(3);
+
+hx = 1 / nx;
+hy = 1 / ny;
+hz = 1 / nz;
+
+ds = [dxyz(1)*hx; dxyz(2)*hy; dxyz(3)*hz];
+ds = ds - round(ds);
+
+rc = cellMat * ds;
+dc = norm(rc);
+
+if dc == 0
+    keep = true;
+    return;
+end
+
+uhat = rc / dc;
+q = cellMat.' * uhat;
+
+pad = abs(q(1))*hx + abs(q(2))*hy + abs(q(3))*hz;
+keep = (dc <= cutoff + pad);
+end
+
+function offsets = local_directional_nonperiodic_offsets(binSize, cutoff, reach)
+rx = reach(1);
+ry = reach(2);
+rz = reach(3);
+
+bx = binSize(1);
+by = binSize(2);
+bz = binSize(3);
+
+buf = zeros((2*rx+1)*(2*ry+1)*(2*rz+1), 3);
+k = 0;
+
+for dx = -rx:rx
+    for dy = -ry:ry
+        for dz = -rz:rz
+            if ~local_keep_half_offset(dx,dy,dz)
+                continue;
+            end
+            if local_keep_offset_directional_nonperiodic([bx by bz], [dx dy dz], cutoff)
+                k = k + 1;
+                buf(k,:) = [dx dy dz];
+            end
+        end
+    end
+end
+
+offsets = buf(1:k, :);
+end
+
+function keep = local_keep_offset_directional_nonperiodic(binSize, dxyz, cutoff)
+bx = binSize(1);
+by = binSize(2);
+bz = binSize(3);
+
+rc = [dxyz(1)*bx; dxyz(2)*by; dxyz(3)*bz];
+dc = norm(rc);
+
+if dc == 0
+    keep = true;
+    return;
+end
+
+uhat = rc / dc;
+
+% Difference of two within-bin offsets ranges over [-bx,bx], [-by,by], [-bz,bz]
+pad = abs(uhat(1))*bx + abs(uhat(2))*by + abs(uhat(3))*bz;
+
+keep = (dc <= cutoff + pad);
+end
+
+function tf = local_keep_half_offset(dx,dy,dz)
+tf = true;
+if dx < 0
+    tf = false;
+    return;
+end
+if dx == 0 && dy < 0
+    tf = false;
+    return;
+end
+if dx == 0 && dy == 0 && dz < 0
+    tf = false;
+    return;
+end
 end
 
 function offsets = local_neighbor_offsets(reach)

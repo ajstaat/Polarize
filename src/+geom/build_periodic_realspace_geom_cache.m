@@ -4,6 +4,12 @@ function cache = build_periodic_realspace_geom_cache(sys, problem, ewaldParams, 
 % cache = geom.build_periodic_realspace_geom_cache(sys, problem, ewaldParams)
 % cache = geom.build_periodic_realspace_geom_cache(sys, problem, ewaldParams, opts)
 %
+% Fast path:
+%   - uses mex_build_periodic_realspace_geom_cache when available
+%
+% Fallback:
+%   - preserves the uploaded MATLAB implementation structure
+%
 % Inputs
 %   sys         canonical polarization-system struct in atomic units
 %   problem     struct from thole.prepare_scf_problem(...)
@@ -142,13 +148,56 @@ function cache = build_periodic_realspace_geom_cache(sys, problem, ewaldParams, 
     rcut2 = rcut^2;
     isSymmetric = isequal(targetMask, sourceMask);
 
-    % ------------------------------------------------------------------
-    % PASS 1: count exact number of interactions
+    mexAvailable = (exist(['mex_build_periodic_realspace_geom_cache.' mexext], 'file') == 3) || ...
+                   (exist('mex_build_periodic_realspace_geom_cache', 'file') == 3);
 
+    if mexAvailable
+        [pair_i, pair_j, image_n, dr_all, r_bare_all, r2_bare_all, nKeep] = ...
+            mex_build_periodic_realspace_geom_cache( ...
+                double(pos), ...
+                double(targetMask), ...
+                double(sourceMask), ...
+                double(H), ...
+                double(rcut));
+
+        cache = struct();
+        cache.mode = 'periodic_realspace_geom';
+        cache.nSites = nSites;
+
+        cache.target_mask = targetMask;
+        cache.source_mask = sourceMask;
+        cache.target_idx = targetSites;
+        cache.source_idx = sourceSites;
+
+        % Backward compatibility
+        cache.site_mask = targetMask;
+        cache.site_idx = targetSites;
+        cache.activeSites = targetSites;
+
+        cache.pair_i = pair_i;
+        cache.pair_j = pair_j;
+        cache.image_n = image_n;
+        cache.dr = dr_all;
+
+        cache.r_bare = r_bare_all;
+        cache.r2_bare = r2_bare_all;
+
+        cache.rcut = rcut;
+        cache.real_image_bounds = [nxmax, nymax, nzmax];
+        cache.nImageShifts = nR;
+        cache.nInteractions = nKeep;
+        cache.includes_self_image = true;
+        cache.is_symmetric_pair_cache = isSymmetric;
+        return;
+    end
+
+    % ------------------------------------------------------------------
+    % MATLAB fallback: preserve uploaded implementation structure
+
+    % PASS 1: count exact number of interactions
     nKeep = 0;
 
     if isSymmetric
-        % Old behavior: unordered distinct-site + self-image.
         nTarget = numel(targetSites);
 
         for aa = 1:(nTarget - 1)
@@ -177,7 +226,6 @@ function cache = build_periodic_realspace_geom_cache(sys, problem, ewaldParams, 
         end
 
     else
-        % Rectangular target/source case: directed target <- source.
         nTarget = numel(targetSites);
         nSource = numel(sourceSites);
 
@@ -192,7 +240,6 @@ function cache = build_periodic_realspace_geom_cache(sys, problem, ewaldParams, 
                 xvec = rij0 + Rshifts;
                 x2 = sum(xvec.^2, 2);
 
-                % Exclude central self only
                 if i == j
                     keep = (x2 > 0) & (x2 <= rcut2);
                 else
@@ -211,9 +258,7 @@ function cache = build_periodic_realspace_geom_cache(sys, problem, ewaldParams, 
     r_bare_all = zeros(nKeep, 1);
     r2_bare_all = zeros(nKeep, 1);
 
-    % ------------------------------------------------------------------
     % PASS 2: fill arrays
-
     nFill = 0;
 
     if isSymmetric
