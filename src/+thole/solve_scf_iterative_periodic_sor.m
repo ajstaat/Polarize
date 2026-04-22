@@ -100,21 +100,21 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
     % ---------------------------------------------------------------------
     % Build or reuse caches
-    
     use_thole = true;
     if isfield(scfParams, 'use_thole') && ~isempty(scfParams.use_thole)
         use_thole = logical(scfParams.use_thole);
     end
-    
-    rowCache = [];
-    realCache = [];
     
     if isfield(scfParams, 'realspace_dipole_row_cache') && ~isempty(scfParams.realspace_dipole_row_cache)
         rowCache = scfParams.realspace_dipole_row_cache;
     elseif isfield(scfParams, 'realspace_row_cache') && ~isempty(scfParams.realspace_row_cache)
         rowCache = scfParams.realspace_row_cache;
     else
-        rowCache = geom.build_periodic_realspace_dipole_row_cache(sys, problem, ewaldParams, scfParams);
+        rowOpts = struct();
+        rowOpts.profile = verbose;
+        rowOpts.use_mex = false;   % until periodic MEX backend exists
+        rowOpts.use_thole = use_thole;
+        rowCache = geom.build_active_row_cache_periodic(sys, problem, ewaldParams, rowOpts);
     end
     
     % Legacy realCache is only needed if someone explicitly provided it

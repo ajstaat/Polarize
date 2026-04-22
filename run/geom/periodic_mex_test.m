@@ -1,24 +1,18 @@
-%% periodic_operator_benchmark_active_row_cache_periodic
-% Focused benchmark / regression test for periodic polarization pieces
-% using the periodic cell-list direct active-row-cache path.
+%% real_periodic_rowcache_validation_medium
+% Validate periodic real-space row-cache on a medium real crystal by comparing:
+%   1) brute-force MIC reference
+%   2) MATLAB periodic row-cache path
+%   3) MEX periodic row-cache path
 %
-% This script:
-%   1) builds a charged-pair periodic test case
-%   2) builds periodic external field
-%   3) prepares the SCF problem
-%   4) builds the periodic active row cache (cell-list/MEX path)
-%   5) builds the periodic k-space cache
-%   6) benchmarks one periodic induced-field application on a probe dipole
-%   7) runs periodic SOR using the periodic active row cache
-%
-% Intended use:
-%   - benchmark the periodic cell-list real-space builder
-%   - compare directly against the older brute-force periodic row-cache path
-%   - keep the rest of the periodic solver path unchanged
+% This test activates all polarizable sites and compares the real-space row cache.
+% It also reconstructs UNIQUE undirected pair sets from each row cache so we can
+% diagnose whether mismatches are due to:
+%   - duplicate insertion, or
+%   - genuinely wrong neighbor ownership / missing pairs.
 
 clear; clc; close all;
 
-fprintf('=== periodic operator benchmark (cell-list active row cache) ===\n');
+fprintf('=== real periodic row-cache validation (medium system) ===\n');
 
 %% ------------------------------------------------------------------------
 % User controls
@@ -28,41 +22,28 @@ cfg = struct();
 cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
 cfg.filename   = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
 
-cfg.supercellSize = [2 5 1];
+cfg.supercellSize = [3 5 1];
 cfg.bondScale     = 1.20;
-cfg.pairCharges   = [+1 -1];
-
-cfg.use_thole = true;
-cfg.verbose   = true;
-cfg.softening = 0.0;
+cfg.verbose       = true;
 
 cfg.periodic = struct();
 cfg.periodic.alpha    = 0.30;
-cfg.periodic.rcut     = 12.0;
+cfg.periodic.rcut     = 8.0;
 cfg.periodic.kcut     = 3.5;
 cfg.periodic.boundary = 'tinfoil';
 
-cfg.sor = struct();
-cfg.sor.tol           = 1e-6;
-cfg.sor.maxIter       = 60;
-cfg.sor.omega         = 0.45;
-cfg.sor.printEvery    = 10;
-cfg.sor.residualEvery = 10;
-cfg.sor.stopMetric    = 'max_dmu';
+cfg.use_thole = true;
 
-cfg.kspace_mode = 'auto';
-cfg.k_block_size = 2048;
-cfg.kspace_memory_limit_gb = 8;
+cfg.compareTolAbs = 1e-11;
+cfg.compareTolRel = 1e-9;
 
-cfg.nWarmup = 1;
-cfg.nRepeat = 3;
-cfg.probeDipoleScale = 1e-3;
+cfg.maxExamplePairs = 20;
 
-cfg.profile_row_cache = true;
-cfg.use_mex = true;
-
-% Optional: manually override periodic cell-list grid shape
-% cfg.grid_shape = [8 8 8];
+ewaldParams = struct();
+ewaldParams.alpha    = cfg.periodic.alpha;
+ewaldParams.rcut     = cfg.periodic.rcut;
+ewaldParams.kcut     = cfg.periodic.kcut;
+ewaldParams.boundary = cfg.periodic.boundary;
 
 %% ------------------------------------------------------------------------
 % Import crystal template
@@ -74,8 +55,8 @@ crystal = io.import_contcar_as_crystal(cfg.filename, ...
     'SortMolecules', false);
 
 fprintf('Imported crystal template:\n');
-fprintf('  nSites     = %d\n', size(crystal.cart_coords, 1));
-fprintf('  nBaseMols  = %d\n', numel(unique(crystal.base_mol_id)));
+fprintf('  nSites    = %d\n', size(crystal.cart_coords, 1));
+fprintf('  nBaseMols = %d\n', numel(unique(crystal.base_mol_id)));
 
 %% ------------------------------------------------------------------------
 % Model
@@ -110,250 +91,214 @@ buildOpts.verbose        = cfg.verbose;
 buildOpts.removeMolIDs   = [];
 buildOpts.activeMolIDs   = [];
 
-sys0 = builder.make_crystal_system(crystal, model, buildOpts);
+sys = builder.make_crystal_system(crystal, model, buildOpts);
 
 fprintf('\nBuilt working system:\n');
-fprintf('  n_unit_sites = %d\n', sys0.n_unit_sites);
-fprintf('  n_cells      = %d\n', sys0.n_cells);
-fprintf('  n_sites      = %d\n', sys0.n_sites);
+fprintf('  n_unit_sites = %d\n', sys.n_unit_sites);
+fprintf('  n_cells      = %d\n', sys.n_cells);
+fprintf('  n_sites      = %d\n', sys.n_sites);
 
 %% ------------------------------------------------------------------------
-% Choose charged pair automatically
+% Extract canonical polarization system
 
-fprintf('\n[setup] choosing charged-pair molecules...\n');
-[refID, ~] = builder.choose_center_reference_molecule(sys0, ...
-    'RequireComplete', true, ...
-    'Verbose', cfg.verbose);
-
-desc = builder.complete_molecule_descriptors_relative_to_reference(sys0, refID, ...
-    'Verbose', cfg.verbose);
-
-sameStack = builder.select_same_stack_neighbor(desc, 1, ...
-    'Direction', 'either', ...
-    'Verbose', cfg.verbose);
-
-if isempty(sameStack.match_table) || height(sameStack.match_table) < 1
-    error('Automatic same-stack shell-1 neighbor selection failed.');
-end
-
-nbrID = sameStack.match_table.molecule_id(1);
-
-fprintf('\nChosen pair:\n');
-fprintf('  ref ID = %d\n', refID);
-fprintf('  nbr ID = %d\n', nbrID);
-
-%% ------------------------------------------------------------------------
-% Apply charges and extract periodic polarization system
-
-fprintf('\n[setup] applying charges and extracting polarization system...\n');
-sys = builder.apply_molecule_charges(sys0, [refID nbrID], ...
-    'Mode', 'uniform', ...
-    'TotalCharges', cfg.pairCharges, ...
-    'SetActive', true, ...
-    'DisablePolarizabilityOnCharged', true, ...
-    'ZeroExistingCharges', true, ...
-    'Verbose', cfg.verbose);
-
+fprintf('\n[setup] extracting canonical polarization system...\n');
 params_extract = struct();
 params_extract.ewald = struct();
 params_extract.ewald.mode = 'periodic';
 
-polsys0 = builder.extract_polarization_system(sys, params_extract);
-io.assert_atomic_units(polsys0);
+polsys = builder.extract_polarization_system(sys, params_extract);
+io.assert_atomic_units(polsys);
 
-H0 = local_get_direct_lattice(polsys0);
-polsys = polsys0;
-polsys.super_lattice = H0;
-
-center0 = 0.5 * sum(H0, 2);
-center_per = 0.5 * sum(polsys.super_lattice, 2);
-shift = (center_per - center0).';
-polsys.site_pos = polsys0.site_pos + shift;
-
-fprintf('\nCanonical polarization system:\n');
+fprintf('Canonical polarization system:\n');
 fprintf('  n_sites             = %d\n', polsys.n_sites);
 fprintf('  n_polarizable_sites = %d\n', nnz(polsys.site_is_polarizable));
 
-ewaldParams = struct();
-ewaldParams.alpha    = cfg.periodic.alpha;
-ewaldParams.rcut     = cfg.periodic.rcut;
-ewaldParams.kcut     = cfg.periodic.kcut;
-ewaldParams.boundary = cfg.periodic.boundary;
+%% ------------------------------------------------------------------------
+% Problem = all polarizable sites active
 
-targetMask = logical(polsys.site_is_polarizable(:));
-sourceMask = abs(polsys.site_charge(:)) > 0;
+problem = struct();
+problem.activeSites = find(polsys.site_is_polarizable(:));
 
-fprintf('\nMask summary:\n');
-fprintf('  n target sites (polarizable) = %d\n', nnz(targetMask));
-fprintf('  n source sites (charged)     = %d\n', nnz(sourceMask));
-fprintf('  total source charge          = %+0.12f\n', sum(polsys.site_charge(sourceMask)));
+fprintf('\nProblem summary:\n');
+fprintf('  nActive = %d\n', numel(problem.activeSites));
 
 %% ------------------------------------------------------------------------
-% Periodic external field
-%
-% Leave this path unchanged for now. The point of this script is the new
-% periodic solver-side real-space cache.
+% Lattice diagnostics
 
-params_per = struct();
-params_per.use_thole = cfg.use_thole;
-params_per.field = struct();
-params_per.field.mode = 'periodic';
-params_per.field.exclude_self = true;
-params_per.field.use_thole_damping = cfg.use_thole;
-params_per.field.target_mask = targetMask;
-params_per.field.source_mask = sourceMask;
-params_per.field.ewald = ewaldParams;
-params_per.field.k_block_size = cfg.k_block_size;
+H = local_get_direct_lattice(polsys);
+Lmin = geom.shortest_lattice_translation(H);
+rcutMaxSafe = 0.5 * Lmin;
 
-fprintf('\n[periodic] building Eext...\n');
-tEext = tic;
-Eext = calc.compute_external_field(polsys, params_per);
-timeEext = toc(tEext);
+fprintf('\nPeriodic real-space geometry:\n');
+fprintf('  lattice lengths = [%.6f %.6f %.6f] bohr\n', ...
+    norm(H(:,1)), norm(H(:,2)), norm(H(:,3)));
+fprintf('  Lmin           = %.6f bohr\n', Lmin);
+fprintf('  Lmin/2         = %.6f bohr\n', rcutMaxSafe);
+fprintf('  requested rcut = %.6f bohr\n', cfg.periodic.rcut);
 
-fprintf('[periodic] Eext done in %.6f s | ||Eext||_F = %.16e\n', ...
-    timeEext, norm(Eext, 'fro'));
-
-%% ------------------------------------------------------------------------
-% Shared solver params / problem
-
-scfParams = struct();
-scfParams.use_thole = cfg.use_thole;
-scfParams.softening = cfg.softening;
-scfParams.verbose = true;
-scfParams.tol = cfg.sor.tol;
-scfParams.maxIter = cfg.sor.maxIter;
-scfParams.omega = cfg.sor.omega;
-scfParams.printEvery = cfg.sor.printEvery;
-scfParams.residualEvery = cfg.sor.residualEvery;
-scfParams.stopMetric = cfg.sor.stopMetric;
-scfParams.kspace_mode = cfg.kspace_mode;
-scfParams.k_block_size = cfg.k_block_size;
-scfParams.kspace_memory_limit_gb = cfg.kspace_memory_limit_gb;
-scfParams.profile = cfg.profile_row_cache;
-scfParams.use_mex = cfg.use_mex;
-
-if isfield(cfg, 'grid_shape')
-    scfParams.grid_shape = cfg.grid_shape;
+if cfg.periodic.rcut >= rcutMaxSafe
+    error(['Chosen rcut violates the single-image condition for this cell.\n' ...
+           'Require rcut < Lmin/2 = %.6f bohr, but got rcut = %.6f bohr.'], ...
+           rcutMaxSafe, cfg.periodic.rcut);
 end
 
-fprintf('\n[periodic] preparing SCF problem...\n');
-tProblem = tic;
-problem = thole.prepare_scf_problem(polsys, Eext, scfParams);
-timeProblem = toc(tProblem);
+%% ------------------------------------------------------------------------
+% Build periodic cell-list spatial index explicitly
 
-fprintf('[periodic] problem prep done in %.6f s | nPolSites = %d\n', ...
-    timeProblem, problem.nPolSites);
+fprintf('\n[setup] building periodic cell-list spatial index explicitly...\n');
+posAct = polsys.site_pos(problem.activeSites, :);
+
+spatialOpts = struct();
+spatialOpts.isPeriodic = true;
+spatialOpts.cell = H;
+spatialOpts.method = 'cell_list';
+spatialOpts.cutoff = cfg.periodic.rcut;
+
+tSpatial = tic;
+spatial = geom.build_spatial_index(posAct, spatialOpts);
+timeSpatial = toc(tSpatial);
+
+fprintf('[setup] spatial backend = %s\n', spatial.backend);
+fprintf('        build time = %.6f s\n', timeSpatial);
+fprintf('        grid_shape = [%d %d %d]\n', spatial.grid_shape);
+fprintf('        search_reach = [%d %d %d]\n', spatial.search_reach);
+fprintf('        n_offsets = %d\n', size(spatial.neighbor_offsets,1));
 
 %% ------------------------------------------------------------------------
-% Build periodic active row cache (cell-list path)
+% Brute-force reference
 
-fprintf('\n[periodic] building solver row cache...\n');
-tRow = tic;
-rowCache = geom.build_active_row_cache_periodic( ...
-    polsys, problem, ewaldParams, scfParams);
-timeRow = toc(tRow);
+fprintf('\n[ref] building brute-force periodic MIC reference...\n');
+tRef = tic;
+ref = local_build_reference_rowcache(polsys, problem, ewaldParams, cfg.use_thole);
+timeRef = toc(tRef);
 
-fprintf('[periodic] solver row cache done in %.6f s | nActive = %d\n', ...
-    timeRow, numel(problem.activeSites));
-
-%% ------------------------------------------------------------------------
-% Build k-space cache
-
-fprintf('\n[periodic] building k-space cache...\n');
-tK = tic;
-kCache = geom.build_periodic_kspace_cache( ...
-    polsys, problem, ewaldParams, scfParams);
-timeK = toc(tK);
-
-fprintf('[periodic] k-space cache done in %.6f s\n', timeK);
+fprintf('[ref] done in %.6f s\n', timeRef);
+fprintf('  nPairsUndirected = %d\n', ref.nPairsUndirected);
+fprintf('  nEntriesDirected = %d\n', ref.nEntriesDirected);
 
 %% ------------------------------------------------------------------------
-% One induced-field apply benchmark on a probe dipole
+% MATLAB path
 
-rng(1);
-mu_probe = zeros(polsys.n_sites, 3);
-mu_probe(problem.polMask, :) = cfg.probeDipoleScale * randn(nnz(problem.polMask), 3);
+fprintf('\n[matlab] building row cache...\n');
+optsMat = struct();
+optsMat.profile = true;
+optsMat.use_mex = false;
+optsMat.use_thole = cfg.use_thole;
 
-dipoleParams = struct();
-dipoleParams.target_mask = targetMask;
-dipoleParams.source_mask = targetMask;
-dipoleParams.use_thole = cfg.use_thole;
-dipoleParams.problem = problem;
-dipoleParams.realspace_row_cache = rowCache;
-dipoleParams.kspace_cache = kCache;
-dipoleParams.kspace_mode = cfg.kspace_mode;
-dipoleParams.kspace_memory_limit_gb = cfg.kspace_memory_limit_gb;
-dipoleParams.k_block_size = cfg.k_block_size;
-dipoleParams.verbose = false;
+tMat = tic;
+rowMat = geom.build_active_row_cache_periodic(polsys, problem, ewaldParams, optsMat, spatial);
+timeMat = toc(tMat);
 
-fprintf('\n[periodic] benchmarking one induced-field apply on probe dipoles...\n');
+fprintf('[matlab] done in %.6f s\n', timeMat);
+fprintf('  nPairsUndirected = %d\n', rowMat.nPairsUndirected);
+fprintf('  nEntriesDirected = %d\n', rowMat.nEntriesDirected);
 
-for k = 1:cfg.nWarmup
-    thole.induced_field_from_dipoles_thole_periodic( ...
-        polsys, mu_probe, ewaldParams, dipoleParams);
+%% ------------------------------------------------------------------------
+% MEX path
+
+mexExists = (exist(['mex_build_active_row_cache_periodic.' mexext], 'file') == 3) || ...
+            (exist('mex_build_active_row_cache_periodic', 'file') == 3);
+
+if ~mexExists
+    error(['Periodic MEX backend was not found on the MATLAB path.\n' ...
+           'Compile mex_build_active_row_cache_periodic first, then rerun this test.']);
 end
 
-tApply = zeros(cfg.nRepeat, 1);
-for k = 1:cfg.nRepeat
-    tic;
-    Eprobe = thole.induced_field_from_dipoles_thole_periodic( ...
-        polsys, mu_probe, ewaldParams, dipoleParams);
-    tApply(k) = toc;
+fprintf('\n[mex] building row cache...\n');
+optsMex = struct();
+optsMex.profile = true;
+optsMex.use_mex = true;
+optsMex.use_thole = cfg.use_thole;
+
+tMex = tic;
+rowMex = geom.build_active_row_cache_periodic(polsys, problem, ewaldParams, optsMex, spatial);
+timeMex = toc(tMex);
+
+fprintf('[mex] done in %.6f s\n', timeMex);
+fprintf('  nPairsUndirected = %d\n', rowMex.nPairsUndirected);
+fprintf('  nEntriesDirected = %d\n', rowMex.nEntriesDirected);
+
+%% ------------------------------------------------------------------------
+% Timing summary
+
+fprintf('\n============================================================\n');
+fprintf('Timing summary\n');
+fprintf('============================================================\n');
+fprintf('  spatial index build : %.6f s\n', timeSpatial);
+fprintf('  brute-force ref     : %.6f s\n', timeRef);
+fprintf('  MATLAB row cache    : %.6f s\n', timeMat);
+fprintf('  MEX row cache       : %.6f s\n', timeMex);
+fprintf('  speedup (MAT/MEX)   : %.3f x\n', timeMat / timeMex);
+
+%% ------------------------------------------------------------------------
+% Raw cache comparisons
+
+fprintf('\n============================================================\n');
+fprintf('Reference vs MATLAB\n');
+fprintf('============================================================\n');
+local_compare_rowcaches(ref, rowMat, cfg.compareTolAbs, cfg.compareTolRel);
+
+fprintf('\n============================================================\n');
+fprintf('Reference vs MEX\n');
+fprintf('============================================================\n');
+local_compare_rowcaches(ref, rowMex, cfg.compareTolAbs, cfg.compareTolRel);
+
+%% ------------------------------------------------------------------------
+% Unique undirected pair-set diagnostics
+
+fprintf('\n============================================================\n');
+fprintf('Unique undirected pair-set diagnostics\n');
+fprintf('============================================================\n');
+
+Pref = geom.rowcache_undirected_pair_set(ref);
+Pmat = geom.rowcache_undirected_pair_set(rowMat);
+Pmex = geom.rowcache_undirected_pair_set(rowMex);
+
+fprintf('  unique undirected pairs (REF) = %d\n', size(Pref,1));
+fprintf('  unique undirected pairs (MAT) = %d\n', size(Pmat,1));
+fprintf('  unique undirected pairs (MEX) = %d\n', size(Pmex,1));
+
+fprintf('  duplicate directed entries implied:\n');
+fprintf('    REF : %d\n', ref.nPairsUndirected - size(Pref,1));
+fprintf('    MAT : %d\n', rowMat.nPairsUndirected - size(Pmat,1));
+fprintf('    MEX : %d\n', rowMex.nPairsUndirected - size(Pmex,1));
+
+extraMat = setdiff(Pmat, Pref, 'rows');
+missMat  = setdiff(Pref, Pmat, 'rows');
+
+extraMex = setdiff(Pmex, Pref, 'rows');
+missMex  = setdiff(Pref, Pmex, 'rows');
+
+fprintf('\nMATLAB pair-set differences vs REF:\n');
+fprintf('  extra pairs = %d\n', size(extraMat,1));
+fprintf('  missing pairs = %d\n', size(missMat,1));
+
+fprintf('\nMEX pair-set differences vs REF:\n');
+fprintf('  extra pairs = %d\n', size(extraMex,1));
+fprintf('  missing pairs = %d\n', size(missMex,1));
+
+if ~isempty(extraMat)
+    fprintf('\nExample extra MATLAB pairs (first %d):\n', min(cfg.maxExamplePairs, size(extraMat,1)));
+    disp(extraMat(1:min(cfg.maxExamplePairs, size(extraMat,1)), :));
 end
-
-fprintf('[periodic] one-apply mean = %.6f s | ||Eprobe||_F = %.16e\n', ...
-    mean(tApply), norm(Eprobe, 'fro'));
-
-%% ------------------------------------------------------------------------
-% Periodic SOR solve using periodic active row cache
-
-scfParamsSolve = scfParams;
-scfParamsSolve.realspace_dipole_row_cache = rowCache;
-scfParamsSolve.kspace_cache = kCache;
-
-fprintf('\n[periodic] solving periodic SOR...\n');
-tSolve = tic;
-[mu, scfOut] = thole.solve_scf_iterative_periodic_sor( ...
-    polsys, Eext, ewaldParams, scfParamsSolve);
-timeSolve = toc(tSolve);
-
-fprintf('[periodic] SOR done in %.6f s | nIter = %d | relres = %.3e\n', ...
-    timeSolve, scfOut.nIter, scfOut.relres);
-
-%% ------------------------------------------------------------------------
-% Dipole summary
-
-local_print_dipole_summary('periodic benchmark (cell-list active row)', polsys, mu);
-
-fprintf('\n--- timing summary ---\n');
-fprintf('  periodic Eext         = %.6f s\n', timeEext);
-fprintf('  problem prep          = %.6f s\n', timeProblem);
-fprintf('  solver row cache      = %.6f s\n', timeRow);
-fprintf('  k-space cache         = %.6f s\n', timeK);
-fprintf('  induced-field apply   = %.6f s\n', mean(tApply));
-fprintf('  periodic SOR          = %.6f s\n', timeSolve);
+if ~isempty(missMat)
+    fprintf('\nExample missing MATLAB pairs (first %d):\n', min(cfg.maxExamplePairs, size(missMat,1)));
+    disp(missMat(1:min(cfg.maxExamplePairs, size(missMat,1)), :));
+end
+if ~isempty(extraMex)
+    fprintf('\nExample extra MEX pairs (first %d):\n', min(cfg.maxExamplePairs, size(extraMex,1)));
+    disp(extraMex(1:min(cfg.maxExamplePairs, size(extraMex,1)), :));
+end
+if ~isempty(missMex)
+    fprintf('\nExample missing MEX pairs (first %d):\n', min(cfg.maxExamplePairs, size(missMex,1)));
+    disp(missMex(1:min(cfg.maxExamplePairs, size(missMex,1)), :));
+end
 
 fprintf('\nDone.\n');
 
 %% ========================================================================
-% local helpers
+% Local helpers
 %% ========================================================================
-
-function local_print_dipole_summary(label, polsys, mu)
-    q = polsys.site_charge(:);
-    r = polsys.site_pos;
-
-    p_src = sum(q .* r, 1);
-    p_ind = sum(mu, 1);
-    p_tot = p_src + p_ind;
-
-    convD = 2.541746;
-
-    fprintf('\n=== %s ===\n', label);
-    fprintf('Bare source |p| = %.6f e*bohr = %.6f D\n', norm(p_src), norm(p_src)*convD);
-    fprintf('Induced    |p| = %.6f e*bohr = %.6f D\n', norm(p_ind), norm(p_ind)*convD);
-    fprintf('Total      |p| = %.6f e*bohr = %.6f D\n', norm(p_tot), norm(p_tot)*convD);
-end
 
 function H = local_get_direct_lattice(sys)
     if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
@@ -363,4 +308,185 @@ function H = local_get_direct_lattice(sys)
     else
         error('Missing direct lattice on system.');
     end
+end
+
+function rowCache = local_build_reference_rowcache(sys, problem, ewaldParams, use_thole)
+    pos = sys.site_pos;
+    activeSites = problem.activeSites(:);
+    posAct = pos(activeSites, :);
+    nActive = numel(activeSites);
+
+    H = local_get_direct_lattice(sys);
+    Hinv = inv(H);
+
+    alphaEwald = ewaldParams.alpha;
+    rcut = ewaldParams.rcut;
+    cutoff2 = rcut^2;
+
+    pairI = [];
+    pairJ = [];
+    drUndir = zeros(0,3);
+    r2Undir = zeros(0,1);
+    rUndir  = zeros(0,1);
+    coeffIsoUndir = zeros(0,1);
+    coeffDyadUndir = zeros(0,1);
+
+    for i = 1:nActive
+        for j = i+1:nActive
+            drRaw = posAct(j,:) - posAct(i,:);
+            drMic = local_mic_displacement(drRaw, H, Hinv);
+            r2 = sum(drMic.^2);
+
+            if r2 <= cutoff2
+                r = sqrt(r2);
+
+                invR2 = 1 / r2;
+                invR  = 1 / r;
+                invR3 = invR * invR2;
+                invR5 = invR3 * invR2;
+                invR4 = invR2^2;
+
+                alpha2 = alphaEwald^2;
+                twoAlphaOverSqrtPi = 2 * alphaEwald / sqrt(pi);
+
+                erfcar = erfc(alphaEwald * r);
+                expar2 = exp(-alpha2 * r2);
+
+                B = erfcar * invR3 + twoAlphaOverSqrtPi * expar2 * invR2;
+                C = 3 * erfcar * invR5 + ...
+                    twoAlphaOverSqrtPi * (2 * alpha2 * invR2 + 3 * invR4) * expar2;
+
+                coeffIso = -B;
+                coeffDyad = +C;
+
+                if use_thole
+                    ai = sys.site_alpha(activeSites(i));
+                    aj = sys.site_alpha(activeSites(j));
+                    [f3, f5] = local_thole_f3f5_scalar(r, ai, aj, sys.thole_a);
+                    l3 = f3 - 1;
+                    l5 = f5 - 1;
+                    coeffIso = coeffIso - l3 * invR3;
+                    coeffDyad = coeffDyad + 3 * l5 * invR5;
+                end
+
+                pairI(end+1,1) = i; %#ok<AGROW>
+                pairJ(end+1,1) = j; %#ok<AGROW>
+                drUndir(end+1,:) = drMic; %#ok<AGROW>
+                r2Undir(end+1,1) = r2; %#ok<AGROW>
+                rUndir(end+1,1)  = r; %#ok<AGROW>
+                coeffIsoUndir(end+1,1) = coeffIso; %#ok<AGROW>
+                coeffDyadUndir(end+1,1) = coeffDyad; %#ok<AGROW>
+            end
+        end
+    end
+
+    nPairs = numel(pairI);
+    rowCounts = accumarray([pairI; pairJ], 1, [nActive,1], @sum, 0);
+
+    row_ptr = zeros(nActive+1,1);
+    row_ptr(1) = 1;
+    row_ptr(2:end) = 1 + cumsum(rowCounts);
+
+    nDir = 2*nPairs;
+    col_idx = zeros(nDir,1);
+    drDir = zeros(nDir,3);
+    r2Dir = zeros(nDir,1);
+    rDir  = zeros(nDir,1);
+    coeffIsoDir = zeros(nDir,1);
+    coeffDyadDir = zeros(nDir,1);
+
+    nextPtr = row_ptr(1:end-1);
+
+    for p = 1:nPairs
+        i = pairI(p);
+        j = pairJ(p);
+
+        k = nextPtr(i);
+        col_idx(k) = j;
+        drDir(k,:) = drUndir(p,:);
+        r2Dir(k) = r2Undir(p);
+        rDir(k) = rUndir(p);
+        coeffIsoDir(k) = coeffIsoUndir(p);
+        coeffDyadDir(k) = coeffDyadUndir(p);
+        nextPtr(i) = k + 1;
+
+        k = nextPtr(j);
+        col_idx(k) = i;
+        drDir(k,:) = -drUndir(p,:);
+        r2Dir(k) = r2Undir(p);
+        rDir(k) = rUndir(p);
+        coeffIsoDir(k) = coeffIsoUndir(p);
+        coeffDyadDir(k) = coeffDyadUndir(p);
+        nextPtr(j) = k + 1;
+    end
+
+    rowCache = struct();
+    rowCache.activeSites = activeSites;
+    rowCache.nActive = nActive;
+    rowCache.row_ptr = row_ptr;
+    rowCache.col_idx = col_idx;
+    rowCache.dr = drDir;
+    rowCache.r2_bare = r2Dir;
+    rowCache.r_bare = rDir;
+    rowCache.coeff_iso = coeffIsoDir;
+    rowCache.coeff_dyad = coeffDyadDir;
+    rowCache.nPairsUndirected = nPairs;
+    rowCache.nEntriesDirected = nDir;
+end
+
+function drMic = local_mic_displacement(drRaw, H, Hinv)
+    sf = (Hinv * drRaw(:)).';
+    sf = sf - round(sf);
+    drMic = (H * sf(:)).';
+end
+
+function [f3, f5] = local_thole_f3f5_scalar(r, alpha_i, alpha_j, a)
+    if r <= 0 || alpha_i <= 0 || alpha_j <= 0 || a <= 0
+        f3 = 1;
+        f5 = 1;
+        return;
+    end
+    aij = (alpha_i * alpha_j)^(1/6);
+    s = a * (r / aij)^3;
+    e = exp(-s);
+    f3 = 1 - e;
+    f5 = 1 - (1 + s) * e;
+end
+
+function local_compare_rowcaches(A, B, absTol, relTol)
+    fprintf('  nPairsUndirected match = %d\n', A.nPairsUndirected == B.nPairsUndirected);
+    fprintf('  nEntriesDirected match = %d\n', A.nEntriesDirected == B.nEntriesDirected);
+    fprintf('  row_ptr exact match    = %d\n', isequal(A.row_ptr, B.row_ptr));
+    fprintf('  col_idx exact match    = %d\n', isequal(A.col_idx, B.col_idx));
+
+    local_report_array_compare('dr', A.dr, B.dr, absTol, relTol);
+    local_report_array_compare('r2_bare', A.r2_bare, B.r2_bare, absTol, relTol);
+    local_report_array_compare('r_bare', A.r_bare, B.r_bare, absTol, relTol);
+    local_report_array_compare('coeff_iso', A.coeff_iso, B.coeff_iso, absTol, relTol);
+    local_report_array_compare('coeff_dyad', A.coeff_dyad, B.coeff_dyad, absTol, relTol);
+end
+
+function local_report_array_compare(name, A, B, absTol, relTol)
+    if ~isequal(size(A), size(B))
+        fprintf('  %s size match      = 0\n', name);
+        fprintf('    size(A) = [%s]\n', num2str(size(A)));
+        fprintf('    size(B) = [%s]\n', num2str(size(B)));
+        return;
+    end
+
+    d = abs(A(:) - B(:));
+    maxAbs = max(d);
+
+    denom = max(max(abs(A(:))), max(abs(B(:))));
+    if denom == 0
+        maxRel = 0;
+    else
+        maxRel = maxAbs / denom;
+    end
+
+    ok = (maxAbs <= absTol) || (maxRel <= relTol);
+
+    fprintf('  %s within tol      = %d\n', name, ok);
+    fprintf('    max abs diff     = %.6e\n', maxAbs);
+    fprintf('    max rel diff     = %.6e\n', maxRel);
 end

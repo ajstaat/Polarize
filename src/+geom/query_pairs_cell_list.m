@@ -22,6 +22,13 @@ function pairs = query_pairs_cell_list(spatial, cutoff, opts)
 %           .r  (if requested)
 %           .index_space
 %           .subset_idx
+%
+% Notes
+%   - For periodic geometry, minimum-image displacement is used.
+%   - Returned pairs are unordered and unique: i < j in the requested index space.
+%   - The periodic cell-list traversal may encounter the same undirected pair
+%     multiple times via wrapped stencil aliases; this routine canonicalizes
+%     and deduplicates before returning.
 
 narginchk(2, 3);
 if nargin < 3 || isempty(opts)
@@ -115,11 +122,21 @@ for binLin = 1:spatial.n_bins
                     while j ~= 0
                         if activeMask(j)
                             [keep, dr, r2] = local_pair_geometry(spatial, i, j, cutoff2);
+                            li = fullToLocal(i);
+                            lj = fullToLocal(j);
+
                             if keep
-                                nPairs = nPairs + 1;
-                                [pairI, pairJ, r2All, drAll] = ...
-                                    local_store(nPairs, pairI, pairJ, r2All, drAll, ...
-                                                fullToLocal(i), fullToLocal(j), r2, dr, returnDr);
+                                if li ~= 0 && lj ~= 0 && li ~= lj
+                                    if li < lj
+                                        ii = li; jj = lj; drCanon = dr;
+                                    else
+                                        ii = lj; jj = li; drCanon = -dr;
+                                    end
+                                    nPairs = nPairs + 1;
+                                    [pairI, pairJ, r2All, drAll] = ...
+                                        local_store(nPairs, pairI, pairJ, r2All, drAll, ...
+                                                    ii, jj, r2, drCanon, returnDr);
+                                end
                             end
                         end
                         j = spatial.bin_next(j);
@@ -135,21 +152,20 @@ for binLin = 1:spatial.n_bins
                     while j ~= 0
                         if activeMask(j)
                             [keep, dr, r2] = local_pair_geometry(spatial, i, j, cutoff2);
+                            li = fullToLocal(i);
+                            lj = fullToLocal(j);
+
                             if keep
-                                ii = i;
-                                jj = j;
-                                li = fullToLocal(ii);
-                                lj = fullToLocal(jj);
-                                if li < lj
+                                if li ~= 0 && lj ~= 0 && li ~= lj
+                                    if li < lj
+                                        ii = li; jj = lj; drCanon = dr;
+                                    else
+                                        ii = lj; jj = li; drCanon = -dr;
+                                    end
                                     nPairs = nPairs + 1;
                                     [pairI, pairJ, r2All, drAll] = ...
                                         local_store(nPairs, pairI, pairJ, r2All, drAll, ...
-                                                    li, lj, r2, dr, returnDr);
-                                elseif lj < li
-                                    nPairs = nPairs + 1;
-                                    [pairI, pairJ, r2All, drAll] = ...
-                                        local_store(nPairs, pairI, pairJ, r2All, drAll, ...
-                                                    lj, li, r2, -dr, returnDr);
+                                                    ii, jj, r2, drCanon, returnDr);
                                 end
                             end
                         end
@@ -167,6 +183,19 @@ pairJ = pairJ(1:nPairs);
 r2All = r2All(1:nPairs);
 if returnDr
     drAll = drAll(1:nPairs, :);
+end
+
+% Deduplicate canonical unordered pairs.
+% Keep the first occurrence (stable) so auxiliary arrays stay aligned.
+if nPairs > 0
+    canon = [pairI, pairJ];
+    [~, ia] = unique(canon, 'rows', 'stable');
+    pairI = pairI(ia);
+    pairJ = pairJ(ia);
+    r2All = r2All(ia);
+    if returnDr
+        drAll = drAll(ia, :);
+    end
 end
 
 if returnFullIdx

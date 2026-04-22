@@ -13,7 +13,7 @@ cfg = struct();
 cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
 cfg.filename   = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
 
-cfg.supercellSize = [5 11 3];
+cfg.supercellSize = [2 5 1];
 cfg.bondScale     = 1.20;
 
 cfg.pairCharges = [+1 -1];
