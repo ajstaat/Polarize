@@ -48,3 +48,17 @@ Used for:
 - neighbor selection
 - completeness checks
 - active/charged molecule assignment
+
+## Nonperiodic cell-list and MEX acceleration
+
+Finite nonperiodic calculations now use a Cartesian **cell list** to accelerate cutoff-based neighbor search. Sites are binned into a 3D grid, nearby bins are searched through a precomputed stencil, and exact Cartesian distances are used to retain only pairs within `rcut`.
+
+This spatial index is then used to build reusable geometric caches, including the **nonperiodic pair cache** and the **active row cache** used by the matrix-free iterative solver.
+
+The heavy cache-building path is accelerated with a **MEX backend**, so the code can quickly:
+
+- enumerate neighbor pairs within cutoff,
+- assemble cached pair geometry once,
+- and reuse that data during iterative solves.
+
+In practice, this moves work out of the solver iterations and into a one-time preprocessing step, substantially reducing the cost of nonperiodic real-space calculations.
