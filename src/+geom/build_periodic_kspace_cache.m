@@ -1,5 +1,5 @@
 function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
-%BUILD_PERIODIC_KSPACE_CACHE Build reciprocal-space Ewald cache.
+%BUILD_PERIODIC_KSPACE_CACHE Build reciprocal-space Ewald cache / plan.
 %
 % kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams)
 % kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
@@ -13,43 +13,14 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
 %       .boundary  optional, default 'tinfoil'
 %
 %   opts        optional struct with fields:
-%       .kspace_mode            'auto' | 'full' | 'chunked' (default 'auto')
+%       .kspace_mode            'auto' | 'full' | 'blocked'
+%                               (legacy alias 'chunked' accepted)
 %       .kspace_memory_limit_gb positive scalar, default 8
 %       .k_block_size           positive integer, default 2048
 %       .verbose                logical, default false
 %
 % Output
-%   kCache      struct with reciprocal-space cache data
-%
-% Fields
-%   .mode               'periodic_kspace'
-%   .nSites
-%   .nPolSites
-%   .activeSites
-%   .full_to_active
-%   .H                  direct lattice matrix (columns are lattice vectors)
-%   .V                  cell volume
-%   .alpha
-%   .kcut
-%   .boundary
-%   .kvecs              Nk x 3 reciprocal vectors
-%   .k2                 Nk x 1 squared norms
-%   .knorm              Nk x 1 norms
-%   .pref               Nk x 1 reciprocal-space prefactors
-%   .kk6                Nk x 6 compact symmetric kk^T entries:
-%                       [kxx kyy kzz kxy kxz kyz]
-%   .num_kvec
-%   .hkmax
-%   .storage_mode       'full' | 'chunked'
-%   .phase_storage      same as storage_mode
-%   .active_pos         nPolSites x 3 active-site positions
-%   .k_block_size       block size for chunked mode
-%   .estimated_full_bytes
-%   .memory_limit_bytes
-%
-% Full-mode-only fields
-%   .cos_phase          nPolSites x Nk
-%   .sin_phase          nPolSites x Nk
+%   kCache struct with reciprocal-space cache / blocked plan data
 
     narginchk(3, 4);
 
@@ -69,9 +40,12 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
     if isfield(opts, 'kspace_mode') && ~isempty(opts.kspace_mode)
         kspace_mode = lower(char(string(opts.kspace_mode)));
     end
-    if ~ismember(kspace_mode, {'auto','full','chunked'})
+    if strcmp(kspace_mode, 'chunked')
+        kspace_mode = 'blocked';
+    end
+    if ~ismember(kspace_mode, {'auto', 'full', 'blocked'})
         error('geom:build_periodic_kspace_cache:BadMode', ...
-            'opts.kspace_mode must be ''auto'', ''full'', or ''chunked''.');
+            'opts.kspace_mode must be ''auto'', ''full'', or ''blocked''.');
     end
 
     kspace_memory_limit_gb = 8;
@@ -145,13 +119,12 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
 
     pos_pol = pos(activeSites, :);
 
-    % Conservative estimate: phase + cos + sin arrays during full-table construction.
     estimated_full_bytes = double(nPolSites) * double(nk) * 8 * 3;
     memory_limit_bytes = kspace_memory_limit_gb * 1024^3;
 
     if strcmp(kspace_mode, 'auto')
         if estimated_full_bytes > memory_limit_bytes
-            storage_mode = 'chunked';
+            storage_mode = 'blocked';
         else
             storage_mode = 'full';
         end
@@ -179,14 +152,20 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
 
     if nk == 0
         kCache.kvecs = zeros(0, 3);
+        kCache.kvecs_T = zeros(3, 0);
         kCache.k2 = zeros(0, 1);
         kCache.knorm = zeros(0, 1);
         kCache.pref = zeros(0, 1);
+        kCache.two_pref = zeros(0, 1);
         kCache.kk6 = zeros(0, 6);
         kCache.cos_phase = zeros(nPolSites, 0);
         kCache.sin_phase = zeros(nPolSites, 0);
         kCache.num_kvec = 0;
         kCache.hkmax = meta.hkmax;
+        kCache.num_blocks = 0;
+        kCache.block_start = zeros(0, 1);
+        kCache.block_end = zeros(0, 1);
+        kCache.blocks = repmat(local_empty_block(nPolSites), 0, 1);
         return;
     end
 
@@ -194,6 +173,7 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
     knorm = meta.knorm(:);
 
     pref = -(4 * pi / V) * exp(-k2 ./ (4 * alpha^2)) ./ k2;
+    two_pref = 2 * pref;
 
     kx = kvecs(:, 1);
     ky = kvecs(:, 2);
@@ -208,9 +188,11 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
     kk6(:, 6) = ky .* kz;
 
     kCache.kvecs = kvecs;
+    kCache.kvecs_T = kvecs.';
     kCache.k2 = k2;
     kCache.knorm = knorm;
     kCache.pref = pref;
+    kCache.two_pref = two_pref;
     kCache.kk6 = kk6;
     kCache.num_kvec = nk;
     kCache.hkmax = meta.hkmax;
@@ -221,27 +203,105 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
             kCache.cos_phase = cos(phase);
             kCache.sin_phase = sin(phase);
 
+            [blockStart, blockEnd, blocks] = local_make_blocks( ...
+                kvecs, pref, two_pref, k_block_size, pos_pol, false);
+            kCache.num_blocks = numel(blockStart);
+            kCache.block_start = blockStart;
+            kCache.block_end = blockEnd;
+            kCache.blocks = blocks;
+
             if verbose
                 fprintf(['build_periodic_kspace_cache: FULL mode | nPol=%d | nK=%d | ' ...
                          'estimated full storage = %.3f GB\n'], ...
                     nPolSites, nk, estimated_full_bytes / 1024^3);
             end
 
-        case 'chunked'
+        case 'blocked'
             kCache.cos_phase = [];
             kCache.sin_phase = [];
 
+            [blockStart, blockEnd, blocks] = local_make_blocks( ...
+                kvecs, pref, two_pref, k_block_size, pos_pol, true);
+            kCache.num_blocks = numel(blockStart);
+            kCache.block_start = blockStart;
+            kCache.block_end = blockEnd;
+            kCache.blocks = blocks;
+
             if verbose
-                fprintf(['build_periodic_kspace_cache: CHUNKED mode | nPol=%d | nK=%d | ' ...
-                         'estimated full storage = %.3f GB exceeds limit %.3f GB | block=%d\n'], ...
+                phaseBlockBytes = 0;
+                for b = 1:kCache.num_blocks
+                    phaseBlockBytes = phaseBlockBytes + ...
+                        8 * numel(kCache.blocks(b).cos_phase) + ...
+                        8 * numel(kCache.blocks(b).sin_phase);
+                end
+
+                fprintf(['build_periodic_kspace_cache: BLOCKED mode | nPol=%d | nK=%d | ' ...
+                         'estimated full storage = %.3f GB | limit = %.3f GB | ' ...
+                         'block=%d | nBlocks=%d | stored block phase tables = %.3f GB\n'], ...
                     nPolSites, nk, estimated_full_bytes / 1024^3, ...
-                    memory_limit_bytes / 1024^3, k_block_size);
+                    memory_limit_bytes / 1024^3, k_block_size, kCache.num_blocks, ...
+                    phaseBlockBytes / 1024^3);
             end
 
         otherwise
             error('geom:build_periodic_kspace_cache:InternalModeError', ...
                 'Unexpected storage_mode.');
     end
+end
+
+function [blockStart, blockEnd, blocks] = local_make_blocks(kvecs, pref, two_pref, k_block_size, pos_pol, store_phase)
+    nk = size(kvecs, 1);
+    nPolSites = size(pos_pol, 1);
+
+    if nk == 0
+        blockStart = zeros(0, 1);
+        blockEnd = zeros(0, 1);
+        blocks = repmat(local_empty_block(nPolSites), 0, 1);
+        return;
+    end
+
+    blockStart = (1:k_block_size:nk).';
+    nBlocks = numel(blockStart);
+    blockEnd = zeros(nBlocks, 1);
+    blocks = repmat(local_empty_block(nPolSites), nBlocks, 1);
+
+    for b = 1:nBlocks
+        i0 = blockStart(b);
+        i1 = min(i0 + k_block_size - 1, nk);
+        idx = i0:i1;
+
+        blockEnd(b) = i1;
+        blocks(b).idx = idx;
+        blocks(b).kvecs = kvecs(idx, :);
+        blocks(b).kvecs_T = kvecs(idx, :).';
+        blocks(b).pref = pref(idx);
+        blocks(b).two_pref = two_pref(idx);
+        blocks(b).nk = numel(idx);
+
+        if store_phase
+            phase = pos_pol * blocks(b).kvecs_T;
+            blocks(b).cos_phase = cos(phase);
+            blocks(b).sin_phase = sin(phase);
+        else
+            blocks(b).cos_phase = zeros(nPolSites, 0);
+            blocks(b).sin_phase = zeros(nPolSites, 0);
+        end
+    end
+end
+
+function blk = local_empty_block(nPolSites)
+    if nargin < 1
+        nPolSites = 0;
+    end
+    blk = struct( ...
+        'idx', zeros(1, 0), ...
+        'kvecs', zeros(0, 3), ...
+        'kvecs_T', zeros(3, 0), ...
+        'pref', zeros(0, 1), ...
+        'two_pref', zeros(0, 1), ...
+        'nk', 0, ...
+        'cos_phase', zeros(nPolSites, 0), ...
+        'sin_phase', zeros(nPolSites, 0));
 end
 
 function H = local_get_direct_lattice(sys)

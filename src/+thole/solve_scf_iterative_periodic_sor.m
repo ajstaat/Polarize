@@ -28,12 +28,14 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 %                 .stopMetric        'max_dmu' | 'relres'
 %                 .use_thole         logical, default true
 %                 .softening         accepted but unused in periodic solver
-%                 .realspace_cache   optional prebuilt real-space cache
+%                 .realspace_dipole_row_cache optional prebuilt row cache
 %                 .realspace_row_cache optional prebuilt row cache
 %                 .kspace_cache      optional prebuilt k-space cache
-%                 .kspace_mode       'auto' | 'full' | 'chunked'
+%                 .kspace_mode       'auto' | 'full' | 'blocked'
+%                                    (legacy alias 'chunked' accepted)
 %                 .kspace_memory_limit_gb positive scalar, default 8
 %                 .k_block_size      positive integer, default 2048
+%                 .use_mex_kspace    logical, default false
 %
 % Output
 %   mu          N x 3 induced dipoles
@@ -93,18 +95,19 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
         use_thole = logical(scfParams.use_thole);
     end
 
+    use_mex_kspace = false;
+    if isfield(scfParams, 'use_mex_kspace') && ~isempty(scfParams.use_mex_kspace)
+        use_mex_kspace = logical(scfParams.use_mex_kspace);
+    end
+
     boundary = 'tinfoil';
     if isfield(ewaldParams, 'boundary') && ~isempty(ewaldParams.boundary)
         boundary = lower(char(string(ewaldParams.boundary)));
     end
 
     % ---------------------------------------------------------------------
-    % Build or reuse caches
-    use_thole = true;
-    if isfield(scfParams, 'use_thole') && ~isempty(scfParams.use_thole)
-        use_thole = logical(scfParams.use_thole);
-    end
-    
+    % Build or reuse real-space row cache
+
     if isfield(scfParams, 'realspace_dipole_row_cache') && ~isempty(scfParams.realspace_dipole_row_cache)
         rowCache = scfParams.realspace_dipole_row_cache;
     elseif isfield(scfParams, 'realspace_row_cache') && ~isempty(scfParams.realspace_row_cache)
@@ -112,19 +115,22 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
     else
         rowOpts = struct();
         rowOpts.profile = verbose;
-        rowOpts.use_mex = false;   % until periodic MEX backend exists
+        rowOpts.use_mex = false;
         rowOpts.use_thole = use_thole;
         rowCache = geom.build_active_row_cache_periodic(sys, problem, ewaldParams, rowOpts);
     end
-    
-    % Legacy realCache is only needed if someone explicitly provided it
-    % and you want to keep it around for diagnostics.
-    if isfield(scfParams, 'realspace_cache') && ~isempty(scfParams.realspace_cache)
-        realCache = scfParams.realspace_cache;
-    end
-    
+
+    % ---------------------------------------------------------------------
+    % Build or reuse k-space cache / plan
+
     if isfield(scfParams, 'kspace_cache') && ~isempty(scfParams.kspace_cache)
         kCache = scfParams.kspace_cache;
+        if strcmpi(kCache.storage_mode, 'chunked')
+            kCache.storage_mode = 'blocked';
+        end
+        if isfield(kCache, 'phase_storage') && strcmpi(kCache.phase_storage, 'chunked')
+            kCache.phase_storage = 'blocked';
+        end
     else
         kOpts = struct();
         if isfield(scfParams, 'kspace_mode') && ~isempty(scfParams.kspace_mode)
@@ -140,11 +146,41 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
         kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams, kOpts);
     end
 
+    if strcmpi(kCache.storage_mode, 'chunked')
+        kCache.storage_mode = 'blocked';
+    end
+    if ~isfield(kCache, 'two_pref') || isempty(kCache.two_pref)
+        kCache.two_pref = 2 * kCache.pref(:);
+    end
+    if ~isfield(kCache, 'kvecs_T') || isempty(kCache.kvecs_T)
+        kCache.kvecs_T = kCache.kvecs.';
+    end
+    if ~isfield(kCache, 'num_blocks') || isempty(kCache.num_blocks)
+        [kCache.block_start, kCache.block_end, kCache.blocks] = ...
+            local_make_k_blocks(kCache.kvecs, kCache.pref(:), kCache.two_pref(:), ...
+                                kCache.k_block_size, kCache.active_pos, false);
+        kCache.num_blocks = numel(kCache.block_start);
+    end
+
+    if use_mex_kspace && strcmpi(kCache.storage_mode, 'blocked')
+        local_assert_mex_available();
+    end
+
+    % ---------------------------------------------------------------------
+    % Timing instrumentation
+
+    profileTimers = struct();
+    profileTimers.t_init_recip_ab   = 0.0;
+    profileTimers.t_real_rows       = 0.0;
+    profileTimers.t_recip_rows      = 0.0;
+    profileTimers.t_recip_updates   = 0.0;
+    profileTimers.t_residual_checks = 0.0;
+
     % ---------------------------------------------------------------------
     % Real-space row data
 
-    row_ptr = rowCache.row_ptr;
-    col_idx = rowCache.col_idx;
+    row_ptr = rowCache.row_ptr(:);
+    col_idx = rowCache.col_idx(:);
     dr_all = rowCache.dr;
     coeff_iso_all = rowCache.coeff_iso(:);
     coeff_dyad_all = rowCache.coeff_dyad(:);
@@ -153,16 +189,11 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
     % Reciprocal-space metadata
 
     nk = kCache.num_kvec;
-    kvecs = kCache.kvecs;
-    pref = kCache.pref(:);
-    two_pref = 2 * pref;
 
     % ---------------------------------------------------------------------
-    % Build local diagonal blocks:
-    %   Ddiag(:,:,i) = Dreal_diag(:,:,i) + Drecip_diag + Dself + Dsurf
+    % Build local diagonal blocks
 
     I3 = eye(3);
-
     Dreal_diag = zeros(3, 3, nPolSites);
 
     for i = 1:nPolSites
@@ -191,9 +222,19 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
     Drecip_diag = zeros(3, 3);
     if nk > 0
-        for m = 1:nk
-            k = kvecs(m, :).';
-            Drecip_diag = Drecip_diag + two_pref(m) * (k * k.');
+        for b = 1:kCache.num_blocks
+            blk = kCache.blocks(b);
+            kb = blk.kvecs;
+            wp = blk.two_pref(:);
+
+            if isempty(kb)
+                continue;
+            end
+
+            for m = 1:blk.nk
+                k = kb(m, :).';
+                Drecip_diag = Drecip_diag + wp(m) * (k * k.');
+            end
         end
     end
 
@@ -231,64 +272,27 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
     % ---------------------------------------------------------------------
     % Initialize reciprocal source sums
 
+    tTmp = tic;
     if nk > 0
-        switch kCache.storage_mode
-            case 'full'
-                cos_phase = kCache.cos_phase;
-                sin_phase = kCache.sin_phase;
-
-                v = mu_pol * kvecs.';
-                A = sum(cos_phase .* v, 1);
-                B = sum(sin_phase .* v, 1);
-
-            case 'chunked'
-                cos_phase = [];
-                sin_phase = [];
-                A = zeros(1, nk);
-                B = zeros(1, nk);
-
-                pos_pol = kCache.active_pos;
-                blk = kCache.k_block_size;
-
-                for k0 = 1:blk:nk
-                    k1 = min(k0 + blk - 1, nk);
-                    idx = k0:k1;
-
-                    kblk = kvecs(idx, :);
-                    phase_blk = pos_pol * kblk.';
-                    cos_blk = cos(phase_blk);
-                    sin_blk = sin(phase_blk);
-                    v_blk = mu_pol * kblk.';
-
-                    A(idx) = sum(cos_blk .* v_blk, 1);
-                    B(idx) = sum(sin_blk .* v_blk, 1);
-                end
-
-            otherwise
-                error('thole:solve_scf_iterative_periodic_sor:BadKspaceMode', ...
-                    'Unknown kCache.storage_mode "%s".', kCache.storage_mode);
-        end
+        [A, B] = local_init_recip_source_sums(mu_pol, kCache);
     else
-        cos_phase = zeros(nPolSites, 0);
-        sin_phase = zeros(nPolSites, 0);
         A = zeros(1, 0);
         B = zeros(1, 0);
     end
+    profileTimers.t_init_recip_ab = profileTimers.t_init_recip_ab + toc(tTmp);
 
     history = zeros(maxIter, 1);
     relresHistory = nan(maxIter, 1);
     converged = false;
 
     if verbose
-        if ~isempty(realCache)
-            nRealPrint = realCache.nInteractions;
-        else
-            nRealPrint = rowCache.nInteractions;
-        end
-        
         fprintf(['SCF(iterative, periodic matrix-free SOR): tol=%.3e, maxIter=%d, omega=%.3f' ...
-                 ' | nReal=%d | nK=%d\n'], ...
-            tol, maxIter, omega, nRealPrint, kCache.num_kvec);
+                 ' | nReal=%d | nK=%d | kMode=%s'], ...
+            tol, maxIter, omega, rowCache.nInteractions, kCache.num_kvec, kCache.storage_mode);
+        if strcmpi(kCache.storage_mode, 'blocked')
+            fprintf(' | mexK=%d', use_mex_kspace);
+        end
+        fprintf('\n');
     end
 
     tSCF = tic;
@@ -298,8 +302,9 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
         for i = 1:nPolSites
             % -------------------------------------------------------------
-            % Real-space row action for current row i
+            % Real-space row action
 
+            tTmp = tic;
             E_real = [0.0, 0.0, 0.0];
 
             idx0 = row_ptr(i);
@@ -318,49 +323,20 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
                 E_real = sum(contrib, 1);
             end
+            profileTimers.t_real_rows = profileTimers.t_real_rows + toc(tTmp);
 
             % -------------------------------------------------------------
-            % Reciprocal-space action for current row i
+            % Reciprocal-space row action
 
+            tTmp = tic;
             E_recip = [0.0, 0.0, 0.0];
             if nk > 0
-                switch kCache.storage_mode
-                    case 'full'
-                        phase_factor = cos_phase(i, :) .* A + sin_phase(i, :) .* B;
-                        w = phase_factor .* two_pref.';
-                        E_recip(1) = w * kvecs(:, 1);
-                        E_recip(2) = w * kvecs(:, 2);
-                        E_recip(3) = w * kvecs(:, 3);
-
-                    case 'chunked'
-                        ri = kCache.active_pos(i, :);
-                        blk = kCache.k_block_size;
-
-                        for k0 = 1:blk:nk
-                            k1 = min(k0 + blk - 1, nk);
-                            idx = k0:k1;
-
-                            kblk = kvecs(idx, :);
-                            phase_i = ri * kblk.';
-                            cos_i = cos(phase_i);
-                            sin_i = sin(phase_i);
-
-                            phase_factor = cos_i .* A(idx) + sin_i .* B(idx);
-                            w = phase_factor .* two_pref(idx).';
-
-                            E_recip(1) = E_recip(1) + w * kblk(:, 1);
-                            E_recip(2) = E_recip(2) + w * kblk(:, 2);
-                            E_recip(3) = E_recip(3) + w * kblk(:, 3);
-                        end
-
-                    otherwise
-                        error('thole:solve_scf_iterative_periodic_sor:BadKspaceMode', ...
-                            'Unknown kCache.storage_mode "%s".', kCache.storage_mode);
-                end
+                E_recip = local_apply_recip_row(i, A, B, kCache, use_mex_kspace);
             end
+            profileTimers.t_recip_rows = profileTimers.t_recip_rows + toc(tTmp);
 
             % -------------------------------------------------------------
-            % Self / surface contributions
+            % Self / surface
 
             mui_current = mu_pol(i, :);
             E_self = self_coeff * mui_current;
@@ -372,7 +348,7 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
             end
 
             % -------------------------------------------------------------
-            % Full field at row i
+            % Update row
 
             E_full = Eext_pol(i, :) + E_real + E_recip + E_self + E_surf;
 
@@ -388,37 +364,12 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
             mu_pol(i, :) = mu_new_i;
 
             % -------------------------------------------------------------
-            % Incrementally update reciprocal source sums A,B
+            % Incremental reciprocal update
 
             if nk > 0 && any(delta_i ~= 0)
-                switch kCache.storage_mode
-                    case 'full'
-                        delta_v = delta_i * kvecs.';
-                        A = A + cos_phase(i, :) .* delta_v;
-                        B = B + sin_phase(i, :) .* delta_v;
-
-                    case 'chunked'
-                        ri = kCache.active_pos(i, :);
-                        blk = kCache.k_block_size;
-
-                        for k0 = 1:blk:nk
-                            k1 = min(k0 + blk - 1, nk);
-                            idx = k0:k1;
-
-                            kblk = kvecs(idx, :);
-                            phase_i = ri * kblk.';
-                            cos_i = cos(phase_i);
-                            sin_i = sin(phase_i);
-                            delta_v = delta_i * kblk.';
-
-                            A(idx) = A(idx) + cos_i .* delta_v;
-                            B(idx) = B(idx) + sin_i .* delta_v;
-                        end
-
-                    otherwise
-                        error('thole:solve_scf_iterative_periodic_sor:BadKspaceMode', ...
-                            'Unknown kCache.storage_mode "%s".', kCache.storage_mode);
-                end
+                tTmp = tic;
+                [A, B] = local_update_recip_source_sums(i, delta_i, A, B, kCache, use_mex_kspace);
+                profileTimers.t_recip_updates = profileTimers.t_recip_updates + toc(tTmp);
             end
         end
 
@@ -433,6 +384,8 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
                      (mod(iter, residualEvery) == 0);
 
         if doResidual
+            tTmp = tic;
+
             dipoleParams = struct();
             dipoleParams.use_thole = use_thole;
             dipoleParams.problem = problem;
@@ -453,6 +406,8 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
             end
             relres = norm(r, 'fro') / bn;
             relresHistory(iter) = relres;
+
+            profileTimers.t_residual_checks = profileTimers.t_residual_checks + toc(tTmp);
         else
             relres = NaN;
         end
@@ -478,6 +433,8 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
 
         if converged
             if ~strcmp(stopMetric, "relres") && isnan(relres)
+                tTmp = tic;
+
                 dipoleParams = struct();
                 dipoleParams.use_thole = use_thole;
                 dipoleParams.problem = problem;
@@ -496,6 +453,8 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
                 end
                 relres = norm(r, 'fro') / bn;
                 relresHistory(iter) = relres;
+
+                profileTimers.t_residual_checks = profileTimers.t_residual_checks + toc(tTmp);
 
                 if verbose
                     fprintf(' final relres = %.3e\n', relres);
@@ -518,6 +477,8 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
         relresHistory = relresHistory(1:maxIter);
 
         if isnan(relresHistory(end))
+            tTmp = tic;
+
             dipoleParams = struct();
             dipoleParams.use_thole = use_thole;
             dipoleParams.problem = problem;
@@ -535,6 +496,8 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
                 bn = 1.0;
             end
             relresHistory(end) = norm(r, 'fro') / bn;
+
+            profileTimers.t_residual_checks = profileTimers.t_residual_checks + toc(tTmp);
         end
 
         if verbose
@@ -561,6 +524,189 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
     scf.used_thole = use_thole;
     scf.used_matrix_solver = false;
     scf.kspace_storage_mode = kCache.storage_mode;
+    scf.use_mex_kspace = use_mex_kspace;
+    scf.profileTimers = profileTimers;
+
+    if verbose
+        fprintf('\nPeriodic SOR timing breakdown:\n');
+        fprintf('  init reciprocal A/B   : %.6f s\n', profileTimers.t_init_recip_ab);
+        fprintf('  real-space row work   : %.6f s\n', profileTimers.t_real_rows);
+        fprintf('  reciprocal row apply  : %.6f s\n', profileTimers.t_recip_rows);
+        fprintf('  reciprocal A/B update : %.6f s\n', profileTimers.t_recip_updates);
+        fprintf('  residual checks       : %.6f s\n', profileTimers.t_residual_checks);
+    end
+end
+
+function [A, B] = local_init_recip_source_sums(mu_pol, kCache)
+    nk = kCache.num_kvec;
+    A = zeros(1, nk);
+    B = zeros(1, nk);
+
+    switch lower(kCache.storage_mode)
+        case 'full'
+            v = mu_pol * kCache.kvecs_T;
+            A = sum(kCache.cos_phase .* v, 1);
+            B = sum(kCache.sin_phase .* v, 1);
+
+        case 'blocked'
+            for b = 1:kCache.num_blocks
+                blk = kCache.blocks(b);
+                if blk.nk == 0
+                    continue;
+                end
+
+                v_blk = mu_pol * blk.kvecs_T;
+                A(blk.idx) = sum(blk.cos_phase .* v_blk, 1);
+                B(blk.idx) = sum(blk.sin_phase .* v_blk, 1);
+            end
+
+        otherwise
+            error('thole:solve_scf_iterative_periodic_sor:BadKspaceMode', ...
+                'Unknown kCache.storage_mode "%s".', kCache.storage_mode);
+    end
+end
+
+function E_recip = local_apply_recip_row(i, A, B, kCache, use_mex_kspace)
+    E_recip = [0.0, 0.0, 0.0];
+
+    switch lower(kCache.storage_mode)
+        case 'full'
+            phase_factor = kCache.cos_phase(i, :) .* A + kCache.sin_phase(i, :) .* B;
+            w = phase_factor .* kCache.two_pref.';
+            E_recip(1) = w * kCache.kvecs(:, 1);
+            E_recip(2) = w * kCache.kvecs(:, 2);
+            E_recip(3) = w * kCache.kvecs(:, 3);
+
+        case 'blocked'
+            for b = 1:kCache.num_blocks
+                blk = kCache.blocks(b);
+                if blk.nk == 0
+                    continue;
+                end
+
+                if use_mex_kspace
+                    Eblk = mex_periodic_kspace_block( ...
+                        'apply_row', ...
+                        A(blk.idx), ...
+                        B(blk.idx), ...
+                        blk.cos_phase(i, :), ...
+                        blk.sin_phase(i, :), ...
+                        blk.two_pref, ...
+                        blk.kvecs);
+                    E_recip = E_recip + Eblk;
+                else
+                    cos_i = blk.cos_phase(i, :);
+                    sin_i = blk.sin_phase(i, :);
+
+                    phase_factor = cos_i .* A(blk.idx) + sin_i .* B(blk.idx);
+                    w = phase_factor .* blk.two_pref.';
+
+                    E_recip(1) = E_recip(1) + w * blk.kvecs(:, 1);
+                    E_recip(2) = E_recip(2) + w * blk.kvecs(:, 2);
+                    E_recip(3) = E_recip(3) + w * blk.kvecs(:, 3);
+                end
+            end
+
+        otherwise
+            error('thole:solve_scf_iterative_periodic_sor:BadKspaceMode', ...
+                'Unknown kCache.storage_mode "%s".', kCache.storage_mode);
+    end
+end
+
+function [A, B] = local_update_recip_source_sums(i, delta_i, A, B, kCache, use_mex_kspace)
+    switch lower(kCache.storage_mode)
+        case 'full'
+            delta_v = delta_i * kCache.kvecs_T;
+            A = A + kCache.cos_phase(i, :) .* delta_v;
+            B = B + kCache.sin_phase(i, :) .* delta_v;
+
+        case 'blocked'
+            for b = 1:kCache.num_blocks
+                blk = kCache.blocks(b);
+                if blk.nk == 0
+                    continue;
+                end
+
+                if use_mex_kspace
+                    [Ablk, Bblk] = mex_periodic_kspace_block( ...
+                        'update_ab', ...
+                        A(blk.idx), ...
+                        B(blk.idx), ...
+                        delta_i, ...
+                        blk.cos_phase(i, :), ...
+                        blk.sin_phase(i, :), ...
+                        blk.kvecs_T);
+                    A(blk.idx) = Ablk;
+                    B(blk.idx) = Bblk;
+                else
+                    cos_i = blk.cos_phase(i, :);
+                    sin_i = blk.sin_phase(i, :);
+                    delta_v = delta_i * blk.kvecs_T;
+
+                    A(blk.idx) = A(blk.idx) + cos_i .* delta_v;
+                    B(blk.idx) = B(blk.idx) + sin_i .* delta_v;
+                end
+            end
+
+        otherwise
+            error('thole:solve_scf_iterative_periodic_sor:BadKspaceMode', ...
+                'Unknown kCache.storage_mode "%s".', kCache.storage_mode);
+    end
+end
+
+function [blockStart, blockEnd, blocks] = local_make_k_blocks(kvecs, pref, two_pref, k_block_size, pos_pol, store_phase)
+    nk = size(kvecs, 1);
+    nPolSites = size(pos_pol, 1);
+
+    if nk == 0
+        blockStart = zeros(0, 1);
+        blockEnd = zeros(0, 1);
+        blocks = repmat(local_empty_block(nPolSites), 0, 1);
+        return;
+    end
+
+    blockStart = (1:k_block_size:nk).';
+    nBlocks = numel(blockStart);
+    blockEnd = zeros(nBlocks, 1);
+    blocks = repmat(local_empty_block(nPolSites), nBlocks, 1);
+
+    for b = 1:nBlocks
+        i0 = blockStart(b);
+        i1 = min(i0 + k_block_size - 1, nk);
+        idx = i0:i1;
+
+        blockEnd(b) = i1;
+        blocks(b).idx = idx;
+        blocks(b).kvecs = kvecs(idx, :);
+        blocks(b).kvecs_T = kvecs(idx, :).';
+        blocks(b).pref = pref(idx);
+        blocks(b).two_pref = two_pref(idx);
+        blocks(b).nk = numel(idx);
+
+        if store_phase
+            phase = pos_pol * blocks(b).kvecs_T;
+            blocks(b).cos_phase = cos(phase);
+            blocks(b).sin_phase = sin(phase);
+        else
+            blocks(b).cos_phase = zeros(nPolSites, 0);
+            blocks(b).sin_phase = zeros(nPolSites, 0);
+        end
+    end
+end
+
+function blk = local_empty_block(nPolSites)
+    if nargin < 1
+        nPolSites = 0;
+    end
+    blk = struct( ...
+        'idx', zeros(1, 0), ...
+        'kvecs', zeros(0, 3), ...
+        'kvecs_T', zeros(3, 0), ...
+        'pref', zeros(0, 1), ...
+        'two_pref', zeros(0, 1), ...
+        'nk', 0, ...
+        'cos_phase', zeros(nPolSites, 0), ...
+        'sin_phase', zeros(nPolSites, 0));
 end
 
 function H = local_get_direct_lattice(sys)
@@ -571,5 +717,14 @@ function H = local_get_direct_lattice(sys)
     else
         error('thole:solve_scf_iterative_periodic_sor:MissingLattice', ...
             'Missing direct lattice on system.');
+    end
+end
+
+function local_assert_mex_available()
+    if exist('mex_periodic_kspace_block', 'file') ~= 3
+        error('thole:solve_scf_iterative_periodic_sor:MissingMexKspace', ...
+            ['use_mex_kspace=true but mex_periodic_kspace_block is not available.\n' ...
+             'Compile it first, e.g.:\n' ...
+             '  mex -O src/+thole/private/mex_periodic_kspace_block.c -outdir src/+thole/private']);
     end
 end

@@ -1,9 +1,24 @@
-%% periodic_direct_vs_sor_real_crystal
-% Compare periodic direct solve vs periodic matrix-free SOR on a real crystal.
+%% test_periodic_external_field_real_crystal
+% Focused test of calc.compute_external_field for a real charged-pair crystal.
+%
+% This script does NOT solve the induced-dipole SCF problem.
+% It only builds nonperiodic and periodic external fields from fixed charges
+% and checks:
+%
+%   1. mask/charge/alpha sanity
+%   2. real vs reciprocal Ewald parts
+%   3. alpha/kcut convergence behavior
+%   4. full vs blocked k-space agreement
+%   5. nonperiodic vs periodic qualitative scale
+%
+% Required recent edits:
+%   - thole.induced_field_from_charges_periodic supports [E, parts]
+%   - geom.build_target_source_field_cache_periodic uses
+%     geom.shortest_lattice_translation(H)
 
 clear; clc; close all;
 
-fprintf('=== periodic direct vs SOR (real crystal) ===\n');
+fprintf('=== periodic external-field test: real charged-pair crystal ===\n');
 
 %% ------------------------------------------------------------------------
 % User controls
@@ -20,26 +35,45 @@ cfg.pairCharges = [+1 -1];
 
 cfg.use_thole = true;
 cfg.verbose = true;
-cfg.softening = 0.0;
 
-cfg.periodic = struct();
-cfg.periodic.alpha    = 0.30;
-cfg.periodic.rcut     = 12.0;
-cfg.periodic.kcut     = 3.5;
-cfg.periodic.boundary = 'tinfoil';
+% Real-space Ewald cutoff. Must obey rcut < Lmin/2 for the supercell.
+cfg.rcut = 11.5;   % bohr
 
-cfg.sor = struct();
-cfg.sor.tol           = 1e-6;
-cfg.sor.maxIter       = 200;
-cfg.sor.omega         = 0.45;
-cfg.sor.printEvery    = 10;
-cfg.sor.residualEvery = 10;
-cfg.sor.stopMetric    = 'max_dmu';
+% A modest starting sweep. Increase kcut if field does not stabilize.
+cfg.alphaList = [0.20 0.25 0.30 0.35 0.40 0.45 0.50];
+
+% Option A: fixed kcut for simple first look.
+cfg.kcut = 3.50;   % bohr^-1
+
+% Option B: coupled alpha/kcut sweep, using kcut = kcutOverAlpha * alpha.
+% Set cfg.useCoupledKcut = true to use this instead of fixed cfg.kcut.
+cfg.useCoupledKcut = false;
+cfg.kcutOverAlpha = 6.0;
+
+cfg.boundary = 'tinfoil';
+
+cfg.kspace_mode = 'full';
+cfg.k_block_size = 2048;
+cfg.kspace_memory_limit_gb = 8;
+
+% Nonperiodic comparison. This intentionally uses uncut external field,
+% matching the earlier nonperiodic example.
+cfg.doNonperiodicComparison = true;
+
+% Full-vs-blocked check can be expensive. It is useful on smaller kcut.
+cfg.doFullVsBlockedCheck = false;
+cfg.fullVsBlockedAlpha = 0.35;
+cfg.fullVsBlockedKcut  = 1.00;
+
+% Optional plots.
+cfg.doPlots = true;
+cfg.plotMaxTargets = 1000;
 
 %% ------------------------------------------------------------------------
 % Import crystal template
 
 fprintf('\n[setup] importing crystal template...\n');
+
 crystal = io.import_contcar_as_crystal(cfg.filename, ...
     'BondScale', cfg.bondScale, ...
     'WrapFractional', true, ...
@@ -75,6 +109,7 @@ model.thole_a = 0.39;
 % Build working system
 
 fprintf('\n[setup] building crystal system...\n');
+
 buildOpts = struct();
 buildOpts.supercell_size = cfg.supercellSize;
 buildOpts.bondScale      = cfg.bondScale;
@@ -93,6 +128,7 @@ fprintf('  n_sites      = %d\n', sys0.n_sites);
 % Automatically choose charged pair
 
 fprintf('\n[setup] choosing charged-pair molecules...\n');
+
 [refID, ~] = builder.choose_center_reference_molecule(sys0, ...
     'RequireComplete', true, ...
     'Verbose', cfg.verbose);
@@ -110,14 +146,15 @@ end
 
 nbrID = sameStack.match_table.molecule_id(1);
 
-fprintf('\nChosen pair (automatic):\n');
+fprintf('\nChosen pair:\n');
 fprintf('  ref ID = %d\n', refID);
 fprintf('  nbr ID = %d\n', nbrID);
 
 %% ------------------------------------------------------------------------
-% Apply charges and disable polarizability on charged molecules
+% Apply charges and extract canonical polarization system
 
 fprintf('\n[setup] applying charges and extracting polarization system...\n');
+
 sys = builder.apply_molecule_charges(sys0, [refID nbrID], ...
     'Mode', 'uniform', ...
     'TotalCharges', cfg.pairCharges, ...
@@ -130,277 +167,315 @@ params_extract = struct();
 params_extract.ewald = struct();
 params_extract.ewald.mode = 'periodic';
 
-polsys0 = builder.extract_polarization_system(sys, params_extract);
-io.assert_atomic_units(polsys0);
+polsys = builder.extract_polarization_system(sys, params_extract);
+H = polsys.super_lattice;
+pos = polsys.site_pos;
 
-H0 = local_get_direct_lattice(polsys0);
-polsys = polsys0;
-polsys.super_lattice = H0;
+fprintf('units.length = %s\n', polsys.units.length);
+fprintf('site_pos extent = [%g %g %g]\n', max(pos,[],1)-min(pos,[],1));
+fprintf('H row lengths   = [%g %g %g]\n', norm(H(1,:)), norm(H(2,:)), norm(H(3,:)));
+fprintf('H col lengths   = [%g %g %g]\n', norm(H(:,1)), norm(H(:,2)), norm(H(:,3)));
 
-center0 = 0.5 * sum(H0, 2);
-center_per = 0.5 * sum(polsys.super_lattice, 2);
-shift = (center_per - center0).';
-polsys.site_pos = polsys0.site_pos + shift;
+io.assert_atomic_units(polsys);
 
 fprintf('\nCanonical polarization system:\n');
 fprintf('  n_sites             = %d\n', polsys.n_sites);
 fprintf('  n_polarizable_sites = %d\n', nnz(polsys.site_is_polarizable));
 
+%% ------------------------------------------------------------------------
+% Mask and alpha sanity
+
 targetMask = logical(polsys.site_is_polarizable(:));
 sourceMask = abs(polsys.site_charge(:)) > 0;
 
-fprintf('\nMask summary:\n');
+sourceCharge = polsys.site_charge(sourceMask);
+sourceAlpha  = polsys.site_alpha(sourceMask);
+targetAlpha  = polsys.site_alpha(targetMask);
+
+fprintf('\n============================================================\n');
+fprintf('MASK / CHARGE / ALPHA SANITY\n');
+fprintf('============================================================\n');
 fprintf('  n target sites (polarizable) = %d\n', nnz(targetMask));
 fprintf('  n source sites (charged)     = %d\n', nnz(sourceMask));
-fprintf('  total source charge          = %+0.12f\n', sum(polsys.site_charge(sourceMask)));
-fprintf('  max |source charge|          = %.12e\n', max(abs(polsys.site_charge(sourceMask))));
+fprintf('  target/source overlap        = %d\n', nnz(targetMask & sourceMask));
+fprintf('  total source charge          = %+0.16e\n', sum(sourceCharge));
+fprintf('  max |source charge|          = %.16e\n', max(abs(sourceCharge)));
+fprintf('  min source alpha             = %.16e\n', min(sourceAlpha));
+fprintf('  max source alpha             = %.16e\n', max(sourceAlpha));
+fprintf('  min target alpha             = %.16e\n', min(targetAlpha));
+fprintf('  max target alpha             = %.16e\n', max(targetAlpha));
+
+if nnz(targetMask & sourceMask) ~= 0
+    error('Charged source sites are still marked polarizable.');
+end
+
+if abs(sum(sourceCharge)) > 1e-10
+    error('Selected charged sources are not neutral.');
+end
+
+if cfg.use_thole && any(sourceAlpha <= 0)
+    error('use_thole = true, but at least one charged source site has nonpositive alpha.');
+end
 
 %% ------------------------------------------------------------------------
-% Shared periodic params
+% Lattice / cutoff sanity
 
-ewaldParams = struct();
-ewaldParams.alpha    = cfg.periodic.alpha;
-ewaldParams.rcut     = cfg.periodic.rcut;
-ewaldParams.kcut     = cfg.periodic.kcut;
-ewaldParams.boundary = cfg.periodic.boundary;
+H = local_get_direct_lattice(polsys);
+Lmin = geom.shortest_lattice_translation(H);
+rcutMaxSafe = 0.5 * Lmin - 1e-12 * max(1, Lmin);
 
 fprintf('\n============================================================\n');
-fprintf('PERIODIC SETTINGS\n');
+fprintf('LATTICE / CUTOFF SANITY\n');
 fprintf('============================================================\n');
-fprintf('  alpha    = %.6f\n', ewaldParams.alpha);
-fprintf('  rcut     = %.6f bohr\n', ewaldParams.rcut);
-fprintf('  kcut     = %.6f bohr^-1\n', ewaldParams.kcut);
-fprintf('  boundary = %s\n', ewaldParams.boundary);
+fprintf('  supercell size    = [%d %d %d]\n', cfg.supercellSize);
+fprintf('  volume            = %.16e bohr^3\n', abs(det(H)));
+fprintf('  Lmin              = %.16e bohr\n', Lmin);
+fprintf('  Lmin/2            = %.16e bohr\n', 0.5 * Lmin);
+fprintf('  max safe rcut     = %.16e bohr\n', rcutMaxSafe);
+fprintf('  requested rcut    = %.16e bohr\n', cfg.rcut);
+
+if ~(cfg.rcut < rcutMaxSafe)
+    error('cfg.rcut violates the single-image condition.');
+end
 
 %% ------------------------------------------------------------------------
-% Build periodic external field once
+% Nonperiodic comparison
 
-params_per = struct();
-params_per.use_thole = cfg.use_thole;
-params_per.field = struct();
-params_per.field.mode = 'periodic';
-params_per.field.exclude_self = true;
-params_per.field.use_thole_damping = cfg.use_thole;
-params_per.field.target_mask = targetMask;
-params_per.field.source_mask = sourceMask;
-params_per.field.ewald = ewaldParams;
+E_nonper = [];
+time_nonper = NaN;
 
-fprintf('\n[periodic] building external field...\n');
-tField = tic;
-Eext = calc.compute_external_field(polsys, params_per);
-timeField = toc(tField);
-fprintf('[periodic] external field done in %.6f s | ||Eext||_F = %.16e\n', ...
-    timeField, norm(Eext, 'fro'));
+if cfg.doNonperiodicComparison
+    fprintf('\n============================================================\n');
+    fprintf('NONPERIODIC EXTERNAL FIELD\n');
+    fprintf('============================================================\n');
 
-%% ------------------------------------------------------------------------
-% Prepare shared SCF problem
+    params_nonper = struct();
+    params_nonper.use_thole = cfg.use_thole;
+    params_nonper.field = struct();
+    params_nonper.field.mode = 'nonperiodic';
+    params_nonper.field.exclude_self = true;
+    params_nonper.field.use_thole_damping = cfg.use_thole;
+    params_nonper.field.target_mask = targetMask;
+    params_nonper.field.source_mask = sourceMask;
 
-scfParams = struct();
-scfParams.use_thole = cfg.use_thole;
-scfParams.softening = cfg.softening;
-scfParams.verbose = true;
-scfParams.printEvery = cfg.sor.printEvery;
-scfParams.residualEvery = cfg.sor.residualEvery;
-scfParams.tol = cfg.sor.tol;
-scfParams.maxIter = cfg.sor.maxIter;
-scfParams.omega = cfg.sor.omega;
-scfParams.stopMetric = cfg.sor.stopMetric;
+    t0 = tic;
+    E_nonper = calc.compute_external_field(polsys, params_nonper);
+    time_nonper = toc(t0);
 
-fprintf('[periodic] preparing SCF problem...\n');
-tProblem = tic;
-problem = thole.prepare_scf_problem(polsys, Eext, scfParams);
-timeProblem = toc(tProblem);
-fprintf('[periodic] problem prep done in %.6f s | nPolSites = %d\n', ...
-    timeProblem, problem.nPolSites);
-
-fprintf('[periodic] building shared matrix-free caches...\n');
-tCache = tic;
-
-cacheParams = struct();
-cacheParams.use_thole = cfg.use_thole;
-
-realCache_shared = geom.build_periodic_realspace_cache( ...
-    polsys, problem, ewaldParams, cacheParams);
-
-rowCache_shared = geom.build_periodic_realspace_row_cache( ...
-    polsys, problem, realCache_shared);
-
-kCache_shared = geom.build_periodic_kspace_cache( ...
-    polsys, problem, ewaldParams);
-
-timeCache = toc(tCache);
-fprintf('[periodic] shared cache build done in %.6f s | nReal=%d | nK=%d\n', ...
-    timeCache, realCache_shared.nInteractions, kCache_shared.num_kvec);
+    local_print_field_summary('nonperiodic', E_nonper, targetMask, time_nonper);
+end
 
 %% ------------------------------------------------------------------------
-% DIRECT periodic solve
+% Periodic alpha/kcut sweep
 
 fprintf('\n============================================================\n');
-fprintf('PERIODIC DIRECT SOLVE\n');
+fprintf('PERIODIC EWALD EXTERNAL FIELD SWEEP\n');
 fprintf('============================================================\n');
 
-fprintf('[direct] assembling periodic operator...\n');
-tAsm = tic;
-[Tpol, Tparts, opinfo] = ewald.assemble_periodic_interaction_matrix( ...
-    polsys, problem, ewaldParams, scfParams); %#ok<NASGU>
-timeAsm = toc(tAsm);
-fprintf('[direct] operator done in %.6f s\n', timeAsm);
+nSweep = numel(cfg.alphaList);
 
-if isfield(opinfo, 'nRealInteractions')
-    fprintf('  nRealInteractions = %d\n', opinfo.nRealInteractions);
+sweep = table();
+sweep.alpha = cfg.alphaList(:);
+sweep.kcut = zeros(nSweep, 1);
+sweep.nK = zeros(nSweep, 1);
+sweep.nRealEntries = zeros(nSweep, 1);
+sweep.normReal = zeros(nSweep, 1);
+sweep.normRecip = zeros(nSweep, 1);
+sweep.normTotal = zeros(nSweep, 1);
+sweep.maxTargetField = zeros(nSweep, 1);
+sweep.realOverTotal = zeros(nSweep, 1);
+sweep.recipOverTotal = zeros(nSweep, 1);
+sweep.relToLast = NaN(nSweep, 1);
+sweep.timeReal = zeros(nSweep, 1);
+sweep.timeRecip = zeros(nSweep, 1);
+sweep.timeTotal = zeros(nSweep, 1);
+sweep.storageMode = strings(nSweep, 1);
+
+E_periodic_all = cell(nSweep, 1);
+parts_all = cell(nSweep, 1);
+
+for ia = 1:nSweep
+    alpha = cfg.alphaList(ia);
+
+    if cfg.useCoupledKcut
+        kcut = cfg.kcutOverAlpha * alpha;
+    else
+        kcut = cfg.kcut;
+    end
+
+    params_per = local_make_periodic_field_params( ...
+        cfg, targetMask, sourceMask, alpha, cfg.rcut, kcut, cfg.kspace_mode);
+
+    fprintf('\n[periodic sweep %d/%d]\n', ia, nSweep);
+    fprintf('  alpha = %.6f\n', alpha);
+    fprintf('  rcut  = %.6f bohr\n', cfg.rcut);
+    fprintf('  kcut  = %.6f bohr^-1\n', kcut);
+
+    t0 = tic;
+    E_per = calc.compute_external_field(polsys, params_per);
+    time_wrapper = toc(t0);
+
+    % Direct parts call, same fieldParams, so we can inspect real/recip.
+    % This recomputes the field. Keeping it separate avoids changing the
+    % calc.compute_external_field wrapper right now.
+    [E_parts_total, parts] = thole.induced_field_from_charges_periodic( ...
+        polsys, params_per.field);
+
+    errParts = norm(E_per - E_parts_total, 'fro') / max(1, norm(E_parts_total, 'fro'));
+    if errParts > 1e-12
+        warning('Wrapper field and direct parts field differ: relerr = %.3e', errParts);
+    end
+
+    E_periodic_all{ia} = E_per;
+    parts_all{ia} = parts;
+
+    sweep.kcut(ia) = kcut;
+    sweep.nK(ia) = parts.nK;
+    sweep.nRealEntries(ia) = parts.nRealEntries;
+    sweep.normReal(ia) = norm(parts.real, 'fro');
+    sweep.normRecip(ia) = norm(parts.recip, 'fro');
+    sweep.normTotal(ia) = norm(E_per, 'fro');
+    sweep.maxTargetField(ia) = max(vecnorm(E_per(targetMask, :), 2, 2));
+    sweep.realOverTotal(ia) = sweep.normReal(ia) / max(eps, sweep.normTotal(ia));
+    sweep.recipOverTotal(ia) = sweep.normRecip(ia) / max(eps, sweep.normTotal(ia));
+    sweep.timeReal(ia) = parts.time_real;
+    sweep.timeRecip(ia) = parts.time_recip;
+    sweep.timeTotal(ia) = time_wrapper;
+    sweep.storageMode(ia) = string(parts.storage_mode);
+
+    local_print_field_summary('periodic total', E_per, targetMask, time_wrapper);
+    fprintf('  ||Ereal||_F       = %.16e\n', sweep.normReal(ia));
+    fprintf('  ||Erecip||_F      = %.16e\n', sweep.normRecip(ia));
+    fprintf('  real/total        = %.16e\n', sweep.realOverTotal(ia));
+    fprintf('  recip/total       = %.16e\n', sweep.recipOverTotal(ia));
+    fprintf('  nK                = %d\n', parts.nK);
+    fprintf('  nRealEntries      = %d\n', parts.nRealEntries);
+    fprintf('  storage mode      = %s\n', parts.storage_mode);
+    fprintf('  time real         = %.6f s\n', parts.time_real);
+    fprintf('  time recip        = %.6f s\n', parts.time_recip);
 end
-if isfield(opinfo, 'num_kvec')
-    fprintf('  num_kvec = %d\n', opinfo.num_kvec);
+
+E_ref = E_periodic_all{end};
+for ia = 1:nSweep
+    sweep.relToLast(ia) = norm(E_periodic_all{ia} - E_ref, 'fro') / ...
+        max(1e-300, norm(E_ref, 'fro'));
 end
 
-fprintf('[direct] solving direct SCF...\n');
-tDirect = tic;
-[mu_direct, scf_direct] = thole.solve_scf_direct(problem, Tpol); %#ok<NASGU>
-timeDirect = toc(tDirect);
-fprintf('[direct] solve done in %.6f s | ||mu||_2 = %.16e\n', ...
-    timeDirect, norm(mu_direct));
-
-fprintf('[direct] computing energies...\n');
-tDirectE = tic;
-E_direct = calc.compute_total_energy_active_space(polsys, problem, mu_direct, Eext, Tpol);
-relres_direct = thole.compute_active_space_relres(problem, Tpol, mu_direct);
-timeDirectE = toc(tDirectE);
-fprintf('[direct] energy postprocessing done in %.6f s | relres = %.16e\n', ...
-    timeDirectE, relres_direct);
+fprintf('\n============================================================\n');
+fprintf('SWEEP SUMMARY\n');
+fprintf('============================================================\n');
+disp(sweep);
 
 %% ------------------------------------------------------------------------
-% PERIODIC SOR solve
+% Compare nonperiodic to final periodic field
 
-fprintf('\n============================================================\n');
-fprintf('PERIODIC MATRIX-FREE SOR SOLVE\n');
-fprintf('============================================================\n');
+if cfg.doNonperiodicComparison
+    fprintf('\n============================================================\n');
+    fprintf('NONPERIODIC VS FINAL PERIODIC\n');
+    fprintf('============================================================\n');
 
-scfParams.realspace_cache = realCache_shared;
-scfParams.realspace_row_cache = rowCache_shared;
-scfParams.kspace_cache = kCache_shared;
+    E_per_final = E_periodic_all{end};
+    dE = E_per_final - E_nonper;
 
-fprintf('[sor] solving periodic matrix-free SOR...\n');
-tSOR = tic;
-[mu_sor, scf_sor] = thole.solve_scf_iterative_periodic_sor( ...
-    polsys, Eext, ewaldParams, scfParams);
-timeSOR = toc(tSOR);
-fprintf('[sor] solve done in %.6f s | ||mu||_2 = %.16e\n', ...
-    timeSOR, norm(mu_sor));
+    fprintf('  ||E_nonper||_F      = %.16e\n', norm(E_nonper, 'fro'));
+    fprintf('  ||E_periodic||_F    = %.16e\n', norm(E_per_final, 'fro'));
+    fprintf('  ||difference||_F    = %.16e\n', norm(dE, 'fro'));
+    fprintf('  rel difference      = %.16e\n', ...
+        norm(dE, 'fro') / max(1e-300, norm(E_per_final, 'fro')));
 
-fprintf('[sor] computing energies with assembled Tpol for apples-to-apples comparison...\n');
-tSORE = tic;
-E_sor = calc.compute_total_energy_active_space(polsys, problem, mu_sor, Eext, Tpol);
-relres_sor_via_T = thole.compute_active_space_relres(problem, Tpol, mu_sor);
-timeSORE = toc(tSORE);
-fprintf('[sor] energy postprocessing done in %.6f s | relres(via Tpol) = %.16e\n', ...
-    timeSORE, relres_sor_via_T);
-
-fprintf('\n============================================================\n');
-fprintf('PERIODIC MATRIX-FREE GMRES SOLVE\n');
-fprintf('============================================================\n');
-
-gmresParams.realspace_cache = realCache_shared;
-gmresParams.realspace_row_cache = rowCache_shared;
-gmresParams.kspace_cache = kCache_shared;
-gmresParams = scfParams;
-gmresParams.restart = 30;              % try [] or 30 or 50
-gmresParams.maxIter = 50;              % outer cycles
-gmresParams.tol = 1e-6;
-gmresParams.use_preconditioner = true;
-gmresParams.verbose = true;
-
-fprintf('[gmres] solving periodic matrix-free GMRES...\n');
-tGMRES = tic;
-[mu_gmres, scf_gmres] = thole.solve_scf_iterative_periodic_gmres( ...
-    polsys, Eext, ewaldParams, gmresParams);
-timeGMRES = toc(tGMRES);
-fprintf('[gmres] solve done in %.6f s | ||mu||_2 = %.16e\n', ...
-    timeGMRES, norm(mu_gmres));
-fprintf('  converged = %d | flag = %d | relres(gmres) = %.16e | relres(physical) = %.16e\n', ...
-    scf_gmres.converged, scf_gmres.flag, scf_gmres.relres, scf_gmres.relres_physical);
-
-fprintf('[gmres] computing energies with assembled Tpol for apples-to-apples comparison...\n');
-tGMRESE = tic;
-E_gmres = calc.compute_total_energy_active_space(polsys, problem, mu_gmres, Eext, Tpol);
-relres_gmres_via_T = thole.compute_active_space_relres(problem, Tpol, mu_gmres);
-timeGMRESE = toc(tGMRESE);
-fprintf('[gmres] energy postprocessing done in %.6f s | relres(via Tpol) = %.16e\n', ...
-    timeGMRESE, relres_gmres_via_T);
-
-mu_diff_abs = norm(mu_gmres - mu_direct);
-mu_diff_rel = mu_diff_abs / max(norm(mu_direct), 1.0);
-
-Etot_diff_abs = abs(E_gmres.total - E_direct.total);
-Etot_diff_rel = Etot_diff_abs / max(abs(E_direct.total), 1.0);
-
-fprintf('\nGMRES comparison vs direct:\n');
-fprintf('  ||mu_gmres - mu_direct||_2   = %.16e\n', mu_diff_abs);
-fprintf('  relative mu difference       = %.16e\n', mu_diff_rel);
-fprintf('  |E_gmres - E_direct|         = %.16e Ha\n', Etot_diff_abs);
-fprintf('  relative energy difference   = %.16e\n', Etot_diff_rel);
+    fprintf('  target RMS nonper   = %.16e\n', local_rms_vec(E_nonper(targetMask,:)));
+    fprintf('  target RMS periodic = %.16e\n', local_rms_vec(E_per_final(targetMask,:)));
+    fprintf('  target RMS diff     = %.16e\n', local_rms_vec(dE(targetMask,:)));
+end
 
 %% ------------------------------------------------------------------------
-% Comparison summary
+% Full-vs-blocked k-space agreement check
 
-mu_diff_abs = norm(mu_sor - mu_direct);
-mu_diff_rel = mu_diff_abs / max(norm(mu_direct), 1.0);
+if cfg.doFullVsBlockedCheck
+    fprintf('\n============================================================\n');
+    fprintf('FULL VS BLOCKED K-SPACE CHECK\n');
+    fprintf('============================================================\n');
 
-Etot_diff_abs = abs(E_sor.total - E_direct.total);
-Etot_diff_rel = Etot_diff_abs / max(abs(E_direct.total), 1.0);
+    alpha = cfg.fullVsBlockedAlpha;
+    kcut = cfg.fullVsBlockedKcut;
 
-fprintf('\n============================================================\n');
-fprintf('COMPARISON SUMMARY\n');
-fprintf('============================================================\n');
+    params_full = local_make_periodic_field_params( ...
+        cfg, targetMask, sourceMask, alpha, cfg.rcut, kcut, 'full');
 
-fprintf('Direct solve:\n');
-fprintf('  total                  = %+0.12e Ha\n', E_direct.total);
-if isfield(E_direct, 'polarization_self')
-    fprintf('  polarization_self      = %+0.12e Ha\n', E_direct.polarization_self);
+    params_blocked = local_make_periodic_field_params( ...
+        cfg, targetMask, sourceMask, alpha, cfg.rcut, kcut, 'blocked');
+
+    fprintf('  alpha = %.6f\n', alpha);
+    fprintf('  rcut  = %.6f bohr\n', cfg.rcut);
+    fprintf('  kcut  = %.6f bohr^-1\n', kcut);
+
+    [E_full, parts_full] = thole.induced_field_from_charges_periodic( ...
+        polsys, params_full.field);
+
+    [E_blocked, parts_blocked] = thole.induced_field_from_charges_periodic( ...
+        polsys, params_blocked.field);
+
+    relFullBlocked = norm(E_full - E_blocked, 'fro') / max(1e-300, norm(E_full, 'fro'));
+
+    fprintf('  nK full       = %d\n', parts_full.nK);
+    fprintf('  nK blocked    = %d\n', parts_blocked.nK);
+    fprintf('  ||E_full||    = %.16e\n', norm(E_full, 'fro'));
+    fprintf('  ||E_blocked|| = %.16e\n', norm(E_blocked, 'fro'));
+    fprintf('  rel diff      = %.16e\n', relFullBlocked);
+
+    if relFullBlocked > 1e-12
+        warning('Full and blocked k-space paths differ by more than 1e-12.');
+    end
 end
-if isfield(E_direct, 'external_charge_dipole')
-    fprintf('  external_charge_dipole = %+0.12e Ha\n', E_direct.external_charge_dipole);
-end
-if isfield(E_direct, 'dipole_dipole')
-    fprintf('  dipole_dipole          = %+0.12e Ha\n', E_direct.dipole_dipole);
-end
-fprintf('  relres                 = %.16e\n', relres_direct);
 
-fprintf('\nSOR solve:\n');
-fprintf('  total                  = %+0.12e Ha\n', E_sor.total);
-if isfield(E_sor, 'polarization_self')
-    fprintf('  polarization_self      = %+0.12e Ha\n', E_sor.polarization_self);
-end
-if isfield(E_sor, 'external_charge_dipole')
-    fprintf('  external_charge_dipole = %+0.12e Ha\n', E_sor.external_charge_dipole);
-end
-if isfield(E_sor, 'dipole_dipole')
-    fprintf('  dipole_dipole          = %+0.12e Ha\n', E_sor.dipole_dipole);
-end
-fprintf('  relres(iterative)      = %.16e\n', scf_sor.relres);
-fprintf('  relres(via Tpol)       = %.16e\n', relres_sor_via_T);
-fprintf('  converged              = %d\n', scf_sor.converged);
-fprintf('  nIter                  = %d\n', scf_sor.nIter);
+%% ------------------------------------------------------------------------
+% Optional plots
 
-fprintf('\nDifferences:\n');
-fprintf('  ||mu_sor - mu_direct||_2      = %.16e\n', mu_diff_abs);
-fprintf('  relative mu difference        = %.16e\n', mu_diff_rel);
-fprintf('  |E_sor - E_direct|            = %.16e Ha\n', Etot_diff_abs);
-fprintf('  relative energy difference    = %.16e\n', Etot_diff_rel);
+if cfg.doPlots
+    fprintf('\n============================================================\n');
+    fprintf('PLOTS\n');
+    fprintf('============================================================\n');
 
-fprintf('\nTiming summary:\n');
-fprintf('  field_time_s          = %.6f\n', timeField);
-fprintf('  problem_time_s        = %.6f\n', timeProblem);
-fprintf('  direct_operator_s     = %.6f\n', timeAsm);
-fprintf('  direct_solve_s        = %.6f\n', timeDirect);
-fprintf('  direct_energy_s       = %.6f\n', timeDirectE);
-fprintf('  sor_solve_s           = %.6f\n', timeSOR);
-fprintf('  sor_energy_s          = %.6f\n', timeSORE);
+    E_final = E_periodic_all{end};
+    parts_final = parts_all{end};
+
+    local_plot_field_magnitudes(E_final, parts_final, targetMask);
+
+    if cfg.doNonperiodicComparison
+        local_plot_periodic_vs_nonperiodic(E_nonper, E_final, targetMask);
+    end
+
+    local_plot_field_vectors(polsys, E_final, targetMask, sourceMask, cfg.plotMaxTargets);
+end
 
 fprintf('\nDone.\n');
 
 %% ========================================================================
 % Local helpers
 %% ========================================================================
+
+function params = local_make_periodic_field_params(cfg, targetMask, sourceMask, alpha, rcut, kcut, kspaceMode)
+    params = struct();
+    params.use_thole = cfg.use_thole;
+
+    params.field = struct();
+    params.field.mode = 'periodic';
+    params.field.exclude_self = true;
+    params.field.use_thole_damping = cfg.use_thole;
+    params.field.target_mask = targetMask;
+    params.field.source_mask = sourceMask;
+    params.field.verbose = false;
+
+    params.field.kspace_mode = kspaceMode;
+    params.field.k_block_size = cfg.k_block_size;
+    params.field.kspace_memory_limit_gb = cfg.kspace_memory_limit_gb;
+
+    params.field.ewald = struct();
+    params.field.ewald.alpha = alpha;
+    params.field.ewald.rcut = rcut;
+    params.field.ewald.kcut = kcut;
+    params.field.ewald.boundary = cfg.boundary;
+end
 
 function H = local_get_direct_lattice(sys)
     if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
@@ -410,4 +485,142 @@ function H = local_get_direct_lattice(sys)
     else
         error('Missing direct lattice on system.');
     end
+end
+
+function local_print_field_summary(label, E, targetMask, elapsed)
+    Et = E(targetMask, :);
+    mag = vecnorm(Et, 2, 2);
+
+    fprintf('  %s:\n', label);
+    fprintf('    time             = %.6f s\n', elapsed);
+    fprintf('    ||E||_F          = %.16e\n', norm(E, 'fro'));
+    fprintf('    target RMS |E|   = %.16e\n', sqrt(mean(mag.^2)));
+    fprintf('    target mean |E|  = %.16e\n', mean(mag));
+    fprintf('    target max |E|   = %.16e\n', max(mag));
+end
+
+function y = local_rms_vec(X)
+    mag = vecnorm(X, 2, 2);
+    y = sqrt(mean(mag.^2));
+end
+
+function local_plot_field_magnitudes(E, parts, targetMask)
+    Etot = E(targetMask, :);
+    Ereal = parts.real(targetMask, :);
+    Erecip = parts.recip(targetMask, :);
+
+    mtot = vecnorm(Etot, 2, 2);
+    mreal = vecnorm(Ereal, 2, 2);
+    mrecip = vecnorm(Erecip, 2, 2);
+
+    figure('Name', 'Periodic external field magnitudes');
+    tiledlayout(3,1);
+
+    nexttile;
+    histogram(mreal, 80);
+    xlabel('|Ereal|');
+    ylabel('count');
+    title('Real-space field magnitude');
+
+    nexttile;
+    histogram(mrecip, 80);
+    xlabel('|Erecip|');
+    ylabel('count');
+    title('Reciprocal-space field magnitude');
+
+    nexttile;
+    histogram(mtot, 80);
+    xlabel('|Etotal|');
+    ylabel('count');
+    title('Total periodic field magnitude');
+end
+
+function local_plot_periodic_vs_nonperiodic(E_nonper, E_per, targetMask)
+    En = E_nonper(targetMask, :);
+    Ep = E_per(targetMask, :);
+
+    mn = vecnorm(En, 2, 2);
+    mp = vecnorm(Ep, 2, 2);
+    md = vecnorm(Ep - En, 2, 2);
+
+    figure('Name', 'Nonperiodic vs periodic external field');
+    tiledlayout(2,1);
+
+    nexttile;
+    plot(mn, mp, '.');
+    xlabel('|E nonperiodic|');
+    ylabel('|E periodic|');
+    title('Field magnitude comparison');
+    grid on;
+    axis equal;
+
+    nexttile;
+    histogram(md, 80);
+    xlabel('|E periodic - E nonperiodic|');
+    ylabel('count');
+    title('Difference magnitude on target sites');
+end
+
+function local_plot_field_vectors(sys, E, targetMask, sourceMask, maxTargets)
+    pos = sys.site_pos;
+
+    targetIdx = find(targetMask);
+    sourceIdx = find(sourceMask);
+
+    if numel(targetIdx) > maxTargets
+        % Deterministic thinning.
+        keep = round(linspace(1, numel(targetIdx), maxTargets));
+        targetIdxPlot = targetIdx(keep);
+    else
+        targetIdxPlot = targetIdx;
+    end
+
+    figure('Name', 'Periodic external field vectors');
+    hold on;
+
+    scatter3(pos(targetIdxPlot,1), pos(targetIdxPlot,2), pos(targetIdxPlot,3), ...
+        8, 'filled');
+
+    scatter3(pos(sourceIdx,1), pos(sourceIdx,2), pos(sourceIdx,3), ...
+        60, 'filled');
+
+    Eplot = E(targetIdxPlot, :);
+    mag = vecnorm(Eplot, 2, 2);
+    nonzero = mag > 0;
+
+    if any(nonzero)
+        scale = 0.2 * local_box_scale(sys) / max(mag(nonzero));
+        quiver3( ...
+            pos(targetIdxPlot(nonzero),1), ...
+            pos(targetIdxPlot(nonzero),2), ...
+            pos(targetIdxPlot(nonzero),3), ...
+            scale * Eplot(nonzero,1), ...
+            scale * Eplot(nonzero,2), ...
+            scale * Eplot(nonzero,3), ...
+            0);
+    end
+
+    if exist('viz.draw_cell_box', 'file') == 2 || exist('+viz/draw_cell_box.m', 'file') == 2
+        H = local_get_direct_lattice(sys);
+        H = H * 1.8897259886;
+        frac = geom.cart_to_frac(sys.site_pos, H);
+        frac_wrapped = frac - floor(frac);
+        pos = geom.frac_to_cart(frac_wrapped, H);
+        boxOrigin = [0 0 0];
+        viz.draw_cell_box(gca, H, boxOrigin, 'rows');
+    end
+
+    xlabel('x / bohr');
+    ylabel('y / bohr');
+    zlabel('z / bohr');
+    title('Periodic external field vectors');
+    axis equal;
+    grid on;
+    view(3);
+    hold off;
+end
+
+function s = local_box_scale(sys)
+    H = local_get_direct_lattice(sys);
+    s = max([norm(H(1,:)), norm(H(2,:)), norm(H(3,:))]);
 end

@@ -5,45 +5,42 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
 % Edip = thole.induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, dipoleParams)
 %
 % Inputs
-%   sys           canonical polarization-system struct in atomic units
-%   mu            N x 3 induced dipoles
-%   ewaldParams   struct with fields:
-%                   .alpha
-%                   .rcut
-%                   .kcut
-%                   .boundary   optional, default 'tinfoil'
+%   sys canonical polarization-system struct in atomic units
+%   mu  N x 3 induced dipoles
+%   ewaldParams struct with fields:
+%       .alpha
+%       .rcut
+%       .kcut
+%       .boundary   optional, default 'tinfoil'
 %
-%   dipoleParams  optional struct with fields:
-%                   .target_mask                 N x 1 logical, optional
-%                   .source_mask                 N x 1 logical, optional
-%                   .use_thole                   logical, default true
-%                   .realspace_cache             optional LEGACY unordered cache
-%                   .realspace_row_cache         optional directed row cache
-%                   .realspace_dipole_coeff_cache optional coeff cache for
-%                                                layered row-geometry path
-%                   .kspace_cache                optional cache from
-%                                                geom.build_periodic_kspace_cache(...)
-%                   .problem                     optional problem struct from
-%                                                thole.prepare_scf_problem(...)
-%                   .kspace_mode                 'auto' | 'full' | 'chunked'
-%                   .kspace_memory_limit_gb      positive scalar, default 8
-%                   .k_block_size                positive integer, default 2048
-%                   .verbose                     logical, default false
+%   dipoleParams optional struct with fields:
+%       .target_mask             N x 1 logical, optional
+%       .source_mask             N x 1 logical, optional
+%       .use_thole               logical, default true
+%       .realspace_row_cache     optional active periodic row cache from
+%                                geom.build_active_row_cache_periodic(...)
+%       .kspace_cache            optional cache from
+%                                geom.build_periodic_kspace_cache(...)
+%       .problem                 optional problem struct from
+%                                thole.prepare_scf_problem(...)
+%       .kspace_mode             'auto' | 'full' | 'blocked'
+%                                (legacy alias 'chunked' accepted)
+%       .kspace_memory_limit_gb  positive scalar, default 8
+%       .k_block_size            positive integer, default 2048
+%       .verbose                 logical, default false
 %
 % Output
-%   Edip          N x 3 periodic induced field
+%   Edip N x 3 periodic induced field
 %
-% Real-space supported modes
-%   (A) Legacy unordered cache:
-%         pair_i, pair_j, dr, coeff_iso, coeff_dyad, nInteractions
-%
-%   (B) Combined directed row cache:
-%         row_ptr, source_full_idx, dr, coeff_iso, coeff_dyad
-%         plus targetSites or activeSites
-%
-%   (C) Layered row cache:
-%         realspace_row_cache            (geometry)
-%         realspace_dipole_coeff_cache   (coeff_iso / coeff_dyad)
+% Notes
+% -----
+% - This version assumes the minimal-branch cache set:
+%     * real-space uses only the active periodic row cache
+%     * reciprocal-space uses full or blocked k-space cache
+% - Legacy unordered / layered periodic real-space cache paths have been removed.
+% - The active periodic row cache is interpreted in the active-space basis:
+%     row_ptr / col_idx / dr / coeff_iso / coeff_dyad
+%   with col_idx indexing activeSites.
 
     io.assert_atomic_units(sys);
 
@@ -115,7 +112,6 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
     if isfield(dipoleParams, 'problem') && ~isempty(dipoleParams.problem)
         problem = dipoleParams.problem;
     end
-
     if isempty(problem)
         polMask = logical(sys.site_is_polarizable(:));
         activeSites = find(polMask);
@@ -124,42 +120,24 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
         problem.polMask = polMask;
         problem.activeSites = activeSites;
         problem.nPolSites = numel(activeSites);
-        problem.activeVecIdx = zeros(3 * numel(activeSites), 1); %#ok<STRNU>
     end
 
     % ---------------------------------------------------------------------
-    % Real-space cache selection
-
-    rowCache = [];
-    coeffCache = [];
-    haveDirectedRowCache = false;
+    % Real-space active periodic row cache
 
     if isfield(dipoleParams, 'realspace_row_cache') && ~isempty(dipoleParams.realspace_row_cache)
         rowCache = dipoleParams.realspace_row_cache;
-        haveDirectedRowCache = true;
-
-        if isfield(dipoleParams, 'realspace_dipole_coeff_cache') && ...
-           ~isempty(dipoleParams.realspace_dipole_coeff_cache)
-            coeffCache = dipoleParams.realspace_dipole_coeff_cache;
-        end
-    end
-
-    realCache = [];
-    if ~haveDirectedRowCache
-        if isfield(dipoleParams, 'realspace_cache') && ~isempty(dipoleParams.realspace_cache)
-            realCache = dipoleParams.realspace_cache;
-        else
-            cacheParams = struct();
-            cacheParams.use_thole = use_thole;
-            cacheParams.verbose = verbose;
-            realCache = geom.build_periodic_realspace_cache(sys, problem, ewaldParams, cacheParams);
-        end
+    else
+        rowOpts = struct();
+        rowOpts.profile   = verbose;
+        rowOpts.use_mex   = false;
+        rowOpts.use_thole = use_thole;
+        rowCache = geom.build_active_row_cache_periodic(sys, problem, ewaldParams, rowOpts);
     end
 
     % ---------------------------------------------------------------------
     % K-space cache
 
-    kCache = [];
     if isfield(dipoleParams, 'kspace_cache') && ~isempty(dipoleParams.kspace_cache)
         kCache = dipoleParams.kspace_cache;
     else
@@ -177,128 +155,71 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
         kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams, kOpts);
     end
 
+    if strcmpi(kCache.storage_mode, 'chunked')
+        kCache.storage_mode = 'blocked';
+    end
+    if isfield(kCache, 'phase_storage') && strcmpi(kCache.phase_storage, 'chunked')
+        kCache.phase_storage = 'blocked';
+    end
+
     Edip = zeros(nSites, 3);
 
     % ---------------------------------------------------------------------
-    % Real-space contribution
+    % Real-space contribution from active periodic row cache
 
-    if haveDirectedRowCache
-        row_ptr = rowCache.row_ptr(:);
-        srcFull = rowCache.source_full_idx(:);
-        dr_all = rowCache.dr;
+    row_ptr = rowCache.row_ptr(:);
+    col_idx = rowCache.col_idx(:);
+    dr_all  = rowCache.dr;
 
-        if isfield(rowCache, 'coeff_iso') && isfield(rowCache, 'coeff_dyad')
-            coeff_iso = rowCache.coeff_iso(:);
-            coeff_dyad = rowCache.coeff_dyad(:);
-        else
-            if isempty(coeffCache)
-                error('thole:induced_field_from_dipoles_thole_periodic:MissingRowCoeffs', ...
-                    ['Directed realspace_row_cache provided without coeff_iso/coeff_dyad, ' ...
-                     'and no realspace_dipole_coeff_cache was supplied.']);
-            end
-            coeff_iso = coeffCache.coeff_iso(:);
-            coeff_dyad = coeffCache.coeff_dyad(:);
-        end
+    if ~isfield(rowCache, 'coeff_iso') || ~isfield(rowCache, 'coeff_dyad')
+        error('thole:induced_field_from_dipoles_thole_periodic:MissingRowCoeffs', ...
+            'realspace_row_cache must provide coeff_iso and coeff_dyad.');
+    end
+    coeff_iso  = rowCache.coeff_iso(:);
+    coeff_dyad = rowCache.coeff_dyad(:);
 
-        if isfield(rowCache, 'targetSites') && ~isempty(rowCache.targetSites)
-            targetSites = rowCache.targetSites(:);
-        elseif isfield(rowCache, 'activeSites') && ~isempty(rowCache.activeSites)
-            targetSites = rowCache.activeSites(:);
-        else
-            error('thole:induced_field_from_dipoles_thole_periodic:MissingRowTargets', ...
-                'Directed row cache must provide targetSites or activeSites.');
-        end
-
-        nTarget = numel(targetSites);
-
-        for a = 1:nTarget
-            iFull = targetSites(a);
-            if ~target_mask(iFull)
-                continue;
-            end
-
-            idx0 = row_ptr(a);
-            idx1 = row_ptr(a + 1) - 1;
-            if idx1 < idx0
-                continue;
-            end
-
-            idx = idx0:idx1;
-            src = srcFull(idx);
-
-            keep = source_mask(src);
-            if ~any(keep)
-                continue;
-            end
-
-            idx = idx(keep);
-            src = src(keep);
-
-            muSrc = mu(src, :);
-            dr = dr_all(idx, :);
-
-            muDotR = sum(muSrc .* dr, 2);
-            contrib = coeff_iso(idx) .* muSrc + ...
-                      coeff_dyad(idx) .* (muDotR .* dr);
-
-            Edip(iFull, :) = Edip(iFull, :) + sum(contrib, 1);
-        end
-
+    if isfield(rowCache, 'activeSites') && ~isempty(rowCache.activeSites)
+        activeSites = rowCache.activeSites(:);
+    elseif isfield(problem, 'activeSites') && ~isempty(problem.activeSites)
+        activeSites = problem.activeSites(:);
     else
-        % Legacy unordered cache path
-        pair_i = realCache.pair_i(:);
-        pair_j = realCache.pair_j(:);
-        dr = realCache.dr;
-        coeff_iso = realCache.coeff_iso(:);
-        coeff_dyad = realCache.coeff_dyad(:);
+        error('thole:induced_field_from_dipoles_thole_periodic:MissingActiveSites', ...
+            'Need activeSites from row cache or problem.');
+    end
 
-        nReal = realCache.nInteractions;
+    nActive = numel(activeSites);
 
-        for p = 1:nReal
-            i = pair_i(p);
-            j = pair_j(p);
-
-            if i == j
-                if ~(target_mask(i) && source_mask(i))
-                    continue;
-                end
-
-                muj = mu(i, :);
-                if all(muj == 0)
-                    continue;
-                end
-
-                rij = dr(p, :);
-                muDotR = dot(muj, rij);
-
-                Edip(i, :) = Edip(i, :) ...
-                    + coeff_iso(p) * muj ...
-                    + coeff_dyad(p) * rij * muDotR;
-            else
-                rij = dr(p, :);
-
-                if target_mask(i) && source_mask(j)
-                    muj = mu(j, :);
-                    if ~all(muj == 0)
-                        muDotR = dot(muj, rij);
-                        Edip(i, :) = Edip(i, :) ...
-                            + coeff_iso(p) * muj ...
-                            + coeff_dyad(p) * rij * muDotR;
-                    end
-                end
-
-                if target_mask(j) && source_mask(i)
-                    mui = mu(i, :);
-                    if ~all(mui == 0)
-                        rji = -rij;
-                        muDotR = dot(mui, rji);
-                        Edip(j, :) = Edip(j, :) ...
-                            + coeff_iso(p) * mui ...
-                            + coeff_dyad(p) * rji * muDotR;
-                    end
-                end
-            end
+    for a = 1:nActive
+        iFull = activeSites(a);
+        if ~target_mask(iFull)
+            continue;
         end
+
+        idx0 = row_ptr(a);
+        idx1 = row_ptr(a + 1) - 1;
+        if idx1 < idx0
+            continue;
+        end
+
+        idx = idx0:idx1;
+        srcActive = col_idx(idx);
+        srcFull = activeSites(srcActive);
+
+        keep = source_mask(srcFull);
+        if ~any(keep)
+            continue;
+        end
+
+        idx = idx(keep);
+        srcFull = srcFull(keep);
+
+        muSrc = mu(srcFull, :);
+        dr = dr_all(idx, :);
+
+        muDotR = sum(muSrc .* dr, 2);
+        contrib = coeff_iso(idx) .* muSrc + coeff_dyad(idx) .* (muDotR .* dr);
+
+        Edip(iFull, :) = Edip(iFull, :) + sum(contrib, 1);
     end
 
     % ---------------------------------------------------------------------
@@ -311,18 +232,16 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
         mu_pol = mu(activeSites, :);
 
         source_active = source_mask(activeSites);
+        target_active = target_mask(activeSites);
+
         mu_src = mu_pol;
         mu_src(~source_active, :) = 0;
 
-        target_active = target_mask(activeSites);
-
-        kvecs = kCache.kvecs;
-        pref = kCache.pref(:);
-        nk = kCache.num_kvec;
-        two_pref = 2 * pref;
-
-        switch kCache.storage_mode
+        switch lower(kCache.storage_mode)
             case 'full'
+                kvecs = kCache.kvecs;
+                two_pref = kCache.two_pref(:);
+
                 cos_phase = kCache.cos_phase;
                 sin_phase = kCache.sin_phase;
 
@@ -340,32 +259,30 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
                 Erecip_pol = [Ex_pol, Ey_pol, Ez_pol];
                 Erecip_pol(~target_active, :) = 0;
 
-            case 'chunked'
+            case 'blocked'
                 pos_pol = kCache.active_pos;
-                blk = kCache.k_block_size;
-
                 Erecip_pol = zeros(nPol, 3);
 
-                for k0 = 1:blk:nk
-                    k1 = min(k0 + blk - 1, nk);
-                    idx = k0:k1;
+                for b = 1:kCache.num_blocks
+                    blk = kCache.blocks(b);
+                    if blk.nk == 0
+                        continue;
+                    end
 
-                    kblk = kvecs(idx, :);
-                    phase_blk = pos_pol * kblk.';
+                    phase_blk = pos_pol * blk.kvecs.';
                     cos_blk = cos(phase_blk);
                     sin_blk = sin(phase_blk);
 
-                    v_blk = mu_src * kblk.';
-
+                    v_blk = mu_src * blk.kvecs.';
                     A_blk = sum(cos_blk .* v_blk, 1);
                     B_blk = sum(sin_blk .* v_blk, 1);
 
                     phase_factor_blk = cos_blk .* A_blk + sin_blk .* B_blk;
-                    W_blk = phase_factor_blk .* (two_pref(idx).');
+                    W_blk = phase_factor_blk .* (blk.two_pref.');
 
-                    Erecip_pol(:, 1) = Erecip_pol(:, 1) + W_blk * kblk(:, 1);
-                    Erecip_pol(:, 2) = Erecip_pol(:, 2) + W_blk * kblk(:, 2);
-                    Erecip_pol(:, 3) = Erecip_pol(:, 3) + W_blk * kblk(:, 3);
+                    Erecip_pol(:, 1) = Erecip_pol(:, 1) + W_blk * blk.kvecs(:, 1);
+                    Erecip_pol(:, 2) = Erecip_pol(:, 2) + W_blk * blk.kvecs(:, 2);
+                    Erecip_pol(:, 3) = Erecip_pol(:, 3) + W_blk * blk.kvecs(:, 3);
                 end
 
                 Erecip_pol(~target_active, :) = 0;
@@ -398,6 +315,7 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
     switch boundary
         case 'tinfoil'
             % no-op
+
         case 'vacuum'
             H = local_get_direct_lattice(sys);
             V = abs(det(H));
@@ -405,6 +323,7 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
 
             Msrc = sum(mu(source_mask, :), 1);
             Edip(target_mask, :) = Edip(target_mask, :) + surf_coeff * Msrc;
+
         otherwise
             error('thole:induced_field_from_dipoles_thole_periodic:UnknownBoundary', ...
                 'boundary must be ''tinfoil'' or ''vacuum''.');

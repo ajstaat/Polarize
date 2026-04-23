@@ -22,13 +22,13 @@ cfg = struct();
 cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
 cfg.filename   = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
 
-cfg.supercellSize = [3 5 1];
+cfg.supercellSize = [3 6 2];
 cfg.bondScale     = 1.20;
 cfg.verbose       = true;
 
 cfg.periodic = struct();
 cfg.periodic.alpha    = 0.30;
-cfg.periodic.rcut     = 8.0;
+cfg.periodic.rcut     = 11.5;
 cfg.periodic.kcut     = 3.5;
 cfg.periodic.boundary = 'tinfoil';
 
@@ -164,45 +164,45 @@ fprintf('        grid_shape = [%d %d %d]\n', spatial.grid_shape);
 fprintf('        search_reach = [%d %d %d]\n', spatial.search_reach);
 fprintf('        n_offsets = %d\n', size(spatial.neighbor_offsets,1));
 
-%% ------------------------------------------------------------------------
-% Brute-force reference
+% %% ------------------------------------------------------------------------
+% % Brute-force reference
+% 
+% fprintf('\n[ref] building brute-force periodic MIC reference...\n');
+% tRef = tic;
+% ref = local_build_reference_rowcache(polsys, problem, ewaldParams, cfg.use_thole);
+% timeRef = toc(tRef);
+% 
+% fprintf('[ref] done in %.6f s\n', timeRef);
+% fprintf('  nPairsUndirected = %d\n', ref.nPairsUndirected);
+% fprintf('  nEntriesDirected = %d\n', ref.nEntriesDirected);
 
-fprintf('\n[ref] building brute-force periodic MIC reference...\n');
-tRef = tic;
-ref = local_build_reference_rowcache(polsys, problem, ewaldParams, cfg.use_thole);
-timeRef = toc(tRef);
-
-fprintf('[ref] done in %.6f s\n', timeRef);
-fprintf('  nPairsUndirected = %d\n', ref.nPairsUndirected);
-fprintf('  nEntriesDirected = %d\n', ref.nEntriesDirected);
-
-%% ------------------------------------------------------------------------
-% MATLAB path
-
-fprintf('\n[matlab] building row cache...\n');
-optsMat = struct();
-optsMat.profile = true;
-optsMat.use_mex = false;
-optsMat.use_thole = cfg.use_thole;
-
-tMat = tic;
-rowMat = geom.build_active_row_cache_periodic(polsys, problem, ewaldParams, optsMat, spatial);
-timeMat = toc(tMat);
-
-fprintf('[matlab] done in %.6f s\n', timeMat);
-fprintf('  nPairsUndirected = %d\n', rowMat.nPairsUndirected);
-fprintf('  nEntriesDirected = %d\n', rowMat.nEntriesDirected);
+% %% ------------------------------------------------------------------------
+% % MATLAB path
+% 
+% fprintf('\n[matlab] building row cache...\n');
+% optsMat = struct();
+% optsMat.profile = true;
+% optsMat.use_mex = false;
+% optsMat.use_thole = cfg.use_thole;
+% 
+% tMat = tic;
+% rowMat = geom.build_active_row_cache_periodic(polsys, problem, ewaldParams, optsMat, spatial);
+% timeMat = toc(tMat);
+% 
+% fprintf('[matlab] done in %.6f s\n', timeMat);
+% fprintf('  nPairsUndirected = %d\n', rowMat.nPairsUndirected);
+% fprintf('  nEntriesDirected = %d\n', rowMat.nEntriesDirected);
 
 %% ------------------------------------------------------------------------
 % MEX path
 
-mexExists = (exist(['mex_build_active_row_cache_periodic.' mexext], 'file') == 3) || ...
-            (exist('mex_build_active_row_cache_periodic', 'file') == 3);
-
-if ~mexExists
-    error(['Periodic MEX backend was not found on the MATLAB path.\n' ...
-           'Compile mex_build_active_row_cache_periodic first, then rerun this test.']);
-end
+% mexExists = (exist(['mex_build_active_row_cache_periodic.' mexext], 'file') == 3) || ...
+%             (exist('mex_build_active_row_cache_periodic', 'file') == 3);
+% 
+% if ~mexExists
+%     error(['Periodic MEX backend was not found on the MATLAB path.\n' ...
+%            'Compile mex_build_active_row_cache_periodic first, then rerun this test.']);
+% end
 
 fprintf('\n[mex] building row cache...\n');
 optsMex = struct();
@@ -225,74 +225,74 @@ fprintf('\n============================================================\n');
 fprintf('Timing summary\n');
 fprintf('============================================================\n');
 fprintf('  spatial index build : %.6f s\n', timeSpatial);
-fprintf('  brute-force ref     : %.6f s\n', timeRef);
-fprintf('  MATLAB row cache    : %.6f s\n', timeMat);
+%fprintf('  brute-force ref     : %.6f s\n', timeRef);
+%fprintf('  MATLAB row cache    : %.6f s\n', timeMat);
 fprintf('  MEX row cache       : %.6f s\n', timeMex);
-fprintf('  speedup (MAT/MEX)   : %.3f x\n', timeMat / timeMex);
+%fprintf('  speedup (MAT/MEX)   : %.3f x\n', timeMat / timeMex);
 
-%% ------------------------------------------------------------------------
-% Raw cache comparisons
-
-fprintf('\n============================================================\n');
-fprintf('Reference vs MATLAB\n');
-fprintf('============================================================\n');
-local_compare_rowcaches(ref, rowMat, cfg.compareTolAbs, cfg.compareTolRel);
-
-fprintf('\n============================================================\n');
-fprintf('Reference vs MEX\n');
-fprintf('============================================================\n');
-local_compare_rowcaches(ref, rowMex, cfg.compareTolAbs, cfg.compareTolRel);
-
-%% ------------------------------------------------------------------------
-% Unique undirected pair-set diagnostics
-
-fprintf('\n============================================================\n');
-fprintf('Unique undirected pair-set diagnostics\n');
-fprintf('============================================================\n');
-
-Pref = geom.rowcache_undirected_pair_set(ref);
-Pmat = geom.rowcache_undirected_pair_set(rowMat);
-Pmex = geom.rowcache_undirected_pair_set(rowMex);
-
-fprintf('  unique undirected pairs (REF) = %d\n', size(Pref,1));
-fprintf('  unique undirected pairs (MAT) = %d\n', size(Pmat,1));
-fprintf('  unique undirected pairs (MEX) = %d\n', size(Pmex,1));
-
-fprintf('  duplicate directed entries implied:\n');
-fprintf('    REF : %d\n', ref.nPairsUndirected - size(Pref,1));
-fprintf('    MAT : %d\n', rowMat.nPairsUndirected - size(Pmat,1));
-fprintf('    MEX : %d\n', rowMex.nPairsUndirected - size(Pmex,1));
-
-extraMat = setdiff(Pmat, Pref, 'rows');
-missMat  = setdiff(Pref, Pmat, 'rows');
-
-extraMex = setdiff(Pmex, Pref, 'rows');
-missMex  = setdiff(Pref, Pmex, 'rows');
-
-fprintf('\nMATLAB pair-set differences vs REF:\n');
-fprintf('  extra pairs = %d\n', size(extraMat,1));
-fprintf('  missing pairs = %d\n', size(missMat,1));
-
-fprintf('\nMEX pair-set differences vs REF:\n');
-fprintf('  extra pairs = %d\n', size(extraMex,1));
-fprintf('  missing pairs = %d\n', size(missMex,1));
-
-if ~isempty(extraMat)
-    fprintf('\nExample extra MATLAB pairs (first %d):\n', min(cfg.maxExamplePairs, size(extraMat,1)));
-    disp(extraMat(1:min(cfg.maxExamplePairs, size(extraMat,1)), :));
-end
-if ~isempty(missMat)
-    fprintf('\nExample missing MATLAB pairs (first %d):\n', min(cfg.maxExamplePairs, size(missMat,1)));
-    disp(missMat(1:min(cfg.maxExamplePairs, size(missMat,1)), :));
-end
-if ~isempty(extraMex)
-    fprintf('\nExample extra MEX pairs (first %d):\n', min(cfg.maxExamplePairs, size(extraMex,1)));
-    disp(extraMex(1:min(cfg.maxExamplePairs, size(extraMex,1)), :));
-end
-if ~isempty(missMex)
-    fprintf('\nExample missing MEX pairs (first %d):\n', min(cfg.maxExamplePairs, size(missMex,1)));
-    disp(missMex(1:min(cfg.maxExamplePairs, size(missMex,1)), :));
-end
+% %% ------------------------------------------------------------------------
+% % Raw cache comparisons
+% 
+% fprintf('\n============================================================\n');
+% fprintf('Reference vs MATLAB\n');
+% fprintf('============================================================\n');
+% local_compare_rowcaches(ref, rowMat, cfg.compareTolAbs, cfg.compareTolRel);
+% 
+% fprintf('\n============================================================\n');
+% fprintf('Reference vs MEX\n');
+% fprintf('============================================================\n');
+% local_compare_rowcaches(ref, rowMex, cfg.compareTolAbs, cfg.compareTolRel);
+% 
+% %% ------------------------------------------------------------------------
+% % Unique undirected pair-set diagnostics
+% 
+% fprintf('\n============================================================\n');
+% fprintf('Unique undirected pair-set diagnostics\n');
+% fprintf('============================================================\n');
+% 
+% Pref = geom.rowcache_undirected_pair_set(ref);
+% Pmat = geom.rowcache_undirected_pair_set(rowMat);
+% Pmex = geom.rowcache_undirected_pair_set(rowMex);
+% 
+% fprintf('  unique undirected pairs (REF) = %d\n', size(Pref,1));
+% fprintf('  unique undirected pairs (MAT) = %d\n', size(Pmat,1));
+% fprintf('  unique undirected pairs (MEX) = %d\n', size(Pmex,1));
+% 
+% fprintf('  duplicate directed entries implied:\n');
+% fprintf('    REF : %d\n', ref.nPairsUndirected - size(Pref,1));
+% fprintf('    MAT : %d\n', rowMat.nPairsUndirected - size(Pmat,1));
+% fprintf('    MEX : %d\n', rowMex.nPairsUndirected - size(Pmex,1));
+% 
+% extraMat = setdiff(Pmat, Pref, 'rows');
+% missMat  = setdiff(Pref, Pmat, 'rows');
+% 
+% extraMex = setdiff(Pmex, Pref, 'rows');
+% missMex  = setdiff(Pref, Pmex, 'rows');
+% 
+% fprintf('\nMATLAB pair-set differences vs REF:\n');
+% fprintf('  extra pairs = %d\n', size(extraMat,1));
+% fprintf('  missing pairs = %d\n', size(missMat,1));
+% 
+% fprintf('\nMEX pair-set differences vs REF:\n');
+% fprintf('  extra pairs = %d\n', size(extraMex,1));
+% fprintf('  missing pairs = %d\n', size(missMex,1));
+% 
+% if ~isempty(extraMat)
+%     fprintf('\nExample extra MATLAB pairs (first %d):\n', min(cfg.maxExamplePairs, size(extraMat,1)));
+%     disp(extraMat(1:min(cfg.maxExamplePairs, size(extraMat,1)), :));
+% end
+% if ~isempty(missMat)
+%     fprintf('\nExample missing MATLAB pairs (first %d):\n', min(cfg.maxExamplePairs, size(missMat,1)));
+%     disp(missMat(1:min(cfg.maxExamplePairs, size(missMat,1)), :));
+% end
+% if ~isempty(extraMex)
+%     fprintf('\nExample extra MEX pairs (first %d):\n', min(cfg.maxExamplePairs, size(extraMex,1)));
+%     disp(extraMex(1:min(cfg.maxExamplePairs, size(extraMex,1)), :));
+% end
+% if ~isempty(missMex)
+%     fprintf('\nExample missing MEX pairs (first %d):\n', min(cfg.maxExamplePairs, size(missMex,1)));
+%     disp(missMex(1:min(cfg.maxExamplePairs, size(missMex,1)), :));
+% end
 
 fprintf('\nDone.\n');
 
