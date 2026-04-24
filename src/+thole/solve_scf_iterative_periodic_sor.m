@@ -249,7 +249,7 @@ function [mu, scf] = solve_scf_iterative_periodic_sor(sys, Eext, ewaldParams, sc
         case 'vacuum'
             H = local_get_direct_lattice(sys);
             V = abs(det(H));
-            surf_coeff = 4 * pi / (3 * V);
+            surf_coeff = -4 * pi / (3 * V);
         otherwise
             error('thole:solve_scf_iterative_periodic_sor:UnknownBoundary', ...
                 'boundary must be ''tinfoil'' or ''vacuum''.');

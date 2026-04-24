@@ -44,7 +44,7 @@ function Tsurf = surface_tensor_block_dipole(H, boundary)
         case 'tinfoil'
             Tsurf = zeros(3, 3);
         case 'vacuum'
-            Tsurf = (4 * pi / (3 * V)) * eye(3);
+            Tsurf = -(4 * pi / (3 * V)) * eye(3);
         otherwise
             error('ewald:surface_tensor_block_dipole:UnknownBoundary', ...
                 'boundary must be ''tinfoil'' or ''vacuum''.');

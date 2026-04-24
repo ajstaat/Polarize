@@ -31,20 +31,27 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
 %       .use_thole_damping    logical, default false
 %       .target_mask          logical N x 1, default site_is_polarizable or all
 %       .source_mask          logical N x 1, default abs(site_charge) > 0
+%       .real_only            logical, default false
+%                             if true, compute only real-space contribution
+%                             and skip reciprocal/surface terms
 %       .kspace_mode          'auto' | 'full' | 'blocked'
 %                             legacy alias 'chunked' is accepted
 %       .k_block_size         positive integer, default 2048
 %       .kspace_memory_limit_gb positive scalar, default 8
 %       .verbose              logical, default false
 %       .ewald                struct with fields .alpha .rcut .kcut
-%                             and optional .boundary (tinfoil only here)
+%                             and optional .boundary ('tinfoil' or 'vacuum')
 %
 % Output
 %   E       N x 3 field at all sites; only target rows are populated
 %   parts   optional diagnostic struct with:
 %             .real
 %             .recip
+%             .surf
 %             .total
+%             .Mq
+%             .Esurf_q
+%             .surf_coeff
 %             .target_mask
 %             .source_mask
 %             .target_sites
@@ -58,8 +65,13 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
 %             .rcut
 %             .kcut
 %             .boundary
+%             .use_thole_damping
+%             .exclude_self
+%             .real_only
 %             .storage_mode
+%             .kspace_mode_requested
 %             .k_block_size
+%             .kspace_memory_limit_gb
 %             .estimated_full_gb
 %             .time_real
 %             .time_recip
@@ -72,7 +84,7 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
 %   Uses geom.build_target_source_field_cache_periodic(...)
 %
 % Reciprocal-space:
-%   Uses the standard periodic Ewald charge field.  Since
+%   Uses the standard periodic Ewald charge field. Since
 %   ewald.enumerate_kvecs_triclinic returns one representative from each
 %   +/- k pair, the real-valued half-k formula is
 %
@@ -88,6 +100,15 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
 %     pref(k) = +(8*pi/V) * exp(-k^2/(4 alpha^2)) / k^2.
 %
 % This implementation requires net-neutral selected sources.
+%
+% Real-only mode:
+%   fieldParams.real_only = true returns only the real-space contribution.
+%   This is intended for mixed P3M workflows:
+%
+%       E_total = E_real,MEX/cache + E_recip,P3M + E_surface
+%
+%   In real-only mode, reciprocal k-vector enumeration and surface terms are
+%   skipped deliberately.
 
     if nargin < 2 || isempty(fieldParams)
         fieldParams = struct();
@@ -134,6 +155,11 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
         verbose = logical(fieldParams.verbose);
     end
 
+    real_only = false;
+    if isfield(fieldParams, 'real_only') && ~isempty(fieldParams.real_only)
+        real_only = logical(fieldParams.real_only);
+    end
+
     if isfield(fieldParams, 'target_mask') && ~isempty(fieldParams.target_mask)
         target_mask = logical(fieldParams.target_mask(:));
     elseif isfield(sys, 'site_is_polarizable') && ~isempty(sys.site_is_polarizable)
@@ -167,9 +193,9 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
     if isfield(ew, 'boundary') && ~isempty(ew.boundary)
         boundary = lower(char(string(ew.boundary)));
     end
-    if ~strcmp(boundary, 'tinfoil')
+    if ~ismember(boundary, {'tinfoil','vacuum'})
         error('thole:induced_field_from_charges_periodic:BoundaryNotSupported', ...
-            'Only tinfoil boundary is supported here.');
+            'boundary must be ''tinfoil'' or ''vacuum''.');
     end
 
     kspace_mode = 'auto';
@@ -215,7 +241,7 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
         if wantParts
             parts = local_make_empty_parts(sys, target_mask, source_mask, ...
                 target_sites, source_sites, alpha, rcut, kcut, boundary, ...
-                kspace_mode, k_block_size, 0.0, toc(tTotal));
+                kspace_mode, k_block_size, 0.0, toc(tTotal), real_only);
         end
         return;
     end
@@ -235,7 +261,9 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
         fprintf('  alpha    = %.6f\n', alpha);
         fprintf('  rcut     = %.6f bohr\n', rcut);
         fprintf('  kcut     = %.6f bohr^-1\n', kcut);
+        fprintf('  boundary = %s\n', boundary);
         fprintf('  use_thole_damping = %d\n', useThole);
+        fprintf('  real_only = %d\n', real_only);
     end
 
     %% --------------------------------------------------------------------
@@ -276,6 +304,83 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
 
     Etarget = ErealTarget;
     Ereal_all(target_sites, :) = ErealTarget;
+
+    %% --------------------------------------------------------------------
+    % Optional real-only return.
+    %
+    % This is useful for mixed P3M workflows:
+    %
+    %   E_total = E_real,MEX/cache + E_recip,P3M + E_surf
+    %
+    % In real-only mode, this function deliberately does not enumerate
+    % k-vectors and does not add the surface term.
+
+    if real_only
+        E(target_sites, :) = Etarget;
+
+        time_recip = 0.0;
+        nk = 0;
+        storage_mode = 'real_only';
+        estimated_full_gb = 0.0;
+
+        Esurf_all = zeros(nSites, 3);
+        Mq = [0.0, 0.0, 0.0];
+        Esurf_q = [0.0, 0.0, 0.0];
+        surf_coeff = 0.0;
+
+        if wantParts
+            parts = struct();
+            parts.real = Ereal_all;
+            parts.recip = Erecip_all;
+            parts.surf = Esurf_all;
+            parts.Mq = Mq;
+            parts.Esurf_q = Esurf_q;
+            parts.surf_coeff = surf_coeff;
+            parts.total = E;
+
+            parts.target_mask = target_mask;
+            parts.source_mask = source_mask;
+            parts.target_sites = target_sites;
+            parts.source_sites = source_sites;
+            parts.qtot = qtot;
+
+            parts.nTargets = nTargets;
+            parts.nSources = nSources;
+            parts.nRealEntries = realCache.nEntries;
+            parts.nK = nk;
+
+            parts.alpha = alpha;
+            parts.rcut = rcut;
+            parts.kcut = kcut;
+            parts.boundary = boundary;
+            parts.use_thole_damping = useThole;
+            parts.exclude_self = exclude_self;
+            parts.real_only = true;
+
+            parts.storage_mode = storage_mode;
+            parts.kspace_mode_requested = kspace_mode;
+            parts.k_block_size = k_block_size;
+            parts.kspace_memory_limit_gb = kspace_memory_limit_gb;
+            parts.estimated_full_gb = estimated_full_gb;
+
+            parts.time_real = time_real;
+            parts.time_recip = time_recip;
+            parts.time_total = toc(tTotal);
+
+            parts.realCache = realCache;
+        end
+
+        if verbose
+            fprintf('  real_only mode: skipping reciprocal and surface terms\n');
+            fprintf('  ||Ereal||_F  = %.16e\n', norm(Ereal_all, 'fro'));
+            fprintf('  ||Etotal||_F = %.16e\n', norm(E, 'fro'));
+            fprintf('  time real    = %.6f s\n', time_real);
+            fprintf('  time recip   = %.6f s\n', time_recip);
+            fprintf('  time total   = %.6f s\n', toc(tTotal));
+        end
+
+        return;
+    end
 
     %% --------------------------------------------------------------------
     % Reciprocal-space contribution
@@ -385,12 +490,44 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
 
     time_recip = toc(tRecip);
 
+    %% --------------------------------------------------------------------
+    % Surface term from fixed-charge cell dipole
+
+    Esurf_all = zeros(nSites, 3);
+    Mq = [0.0, 0.0, 0.0];
+    Esurf_q = [0.0, 0.0, 0.0];
+    surf_coeff = 0.0;
+
+    switch boundary
+        case 'tinfoil'
+            % no surface term
+
+        case 'vacuum'
+            % Neutral source charge distribution, so Mq is origin-independent
+            % for a fixed Cartesian branch.
+            Mq = sum(qsrc .* pos(source_sites, :), 1);
+
+            surf_coeff = 4 * pi / (3 * V);
+            Esurf_q = -surf_coeff * Mq;
+
+            Etarget = Etarget + Esurf_q;
+            Esurf_all(target_sites, :) = repmat(Esurf_q, nTargets, 1);
+
+        otherwise
+            error('thole:induced_field_from_charges_periodic:UnknownBoundary', ...
+                'Unknown boundary "%s".', boundary);
+    end
+
     E(target_sites, :) = Etarget;
 
     if wantParts
         parts = struct();
         parts.real = Ereal_all;
         parts.recip = Erecip_all;
+        parts.surf = Esurf_all;
+        parts.Mq = Mq;
+        parts.Esurf_q = Esurf_q;
+        parts.surf_coeff = surf_coeff;
         parts.total = E;
 
         parts.target_mask = target_mask;
@@ -410,6 +547,7 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
         parts.boundary = boundary;
         parts.use_thole_damping = useThole;
         parts.exclude_self = exclude_self;
+        parts.real_only = false;
 
         parts.storage_mode = storage_mode;
         parts.kspace_mode_requested = kspace_mode;
@@ -427,6 +565,7 @@ function [E, parts] = induced_field_from_charges_periodic(sys, fieldParams)
     if verbose
         fprintf('  ||Ereal||_F  = %.16e\n', norm(Ereal_all, 'fro'));
         fprintf('  ||Erecip||_F = %.16e\n', norm(Erecip_all, 'fro'));
+        fprintf('  ||Esurf||_F  = %.16e\n', norm(Esurf_all, 'fro'));
         fprintf('  ||Etotal||_F = %.16e\n', norm(E, 'fro'));
         fprintf('  time real    = %.6f s\n', time_real);
         fprintf('  time recip   = %.6f s\n', time_recip);
@@ -436,13 +575,17 @@ end
 
 function parts = local_make_empty_parts(sys, target_mask, source_mask, ...
     target_sites, source_sites, alpha, rcut, kcut, boundary, ...
-    kspace_mode, k_block_size, time_before_return, time_total)
+    kspace_mode, k_block_size, time_before_return, time_total, real_only)
 
     nSites = size(sys.site_pos, 1);
 
     parts = struct();
     parts.real = zeros(nSites, 3);
     parts.recip = zeros(nSites, 3);
+    parts.surf = zeros(nSites, 3);
+    parts.Mq = [0.0, 0.0, 0.0];
+    parts.Esurf_q = [0.0, 0.0, 0.0];
+    parts.surf_coeff = 0.0;
     parts.total = zeros(nSites, 3);
 
     parts.target_mask = target_mask;
@@ -462,8 +605,13 @@ function parts = local_make_empty_parts(sys, target_mask, source_mask, ...
     parts.boundary = boundary;
     parts.use_thole_damping = false;
     parts.exclude_self = true;
+    parts.real_only = real_only;
 
-    parts.storage_mode = 'none';
+    if real_only
+        parts.storage_mode = 'real_only';
+    else
+        parts.storage_mode = 'none';
+    end
     parts.kspace_mode_requested = kspace_mode;
     parts.k_block_size = k_block_size;
     parts.kspace_memory_limit_gb = NaN;

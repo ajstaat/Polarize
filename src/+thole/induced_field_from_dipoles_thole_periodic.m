@@ -319,7 +319,7 @@ function Edip = induced_field_from_dipoles_thole_periodic(sys, mu, ewaldParams, 
         case 'vacuum'
             H = local_get_direct_lattice(sys);
             V = abs(det(H));
-            surf_coeff = 4 * pi / (3 * V);
+            surf_coeff = -4 * pi / (3 * V);
 
             Msrc = sum(mu(source_mask, :), 1);
             Edip(target_mask, :) = Edip(target_mask, :) + surf_coeff * Msrc;

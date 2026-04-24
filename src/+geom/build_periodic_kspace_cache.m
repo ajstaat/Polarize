@@ -1,26 +1,22 @@
 function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
 %BUILD_PERIODIC_KSPACE_CACHE Build reciprocal-space Ewald cache / plan.
 %
-% kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams)
-% kCache = geom.build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
+% Project lattice convention:
 %
-% Inputs
-%   sys         canonical polarization-system struct in atomic units
-%   problem     struct from thole.prepare_scf_problem(...)
-%   ewaldParams struct with fields:
-%       .alpha     Ewald screening parameter
-%       .kcut      reciprocal-space cutoff
-%       .boundary  optional, default 'tinfoil'
+%   H has direct lattice vectors as rows:
 %
-%   opts        optional struct with fields:
-%       .kspace_mode            'auto' | 'full' | 'blocked'
-%                               (legacy alias 'chunked' accepted)
-%       .kspace_memory_limit_gb positive scalar, default 8
-%       .k_block_size           positive integer, default 2048
-%       .verbose                logical, default false
+%       r_cart = f_frac * H
 %
-% Output
-%   kCache struct with reciprocal-space cache / blocked plan data
+%   G has reciprocal lattice vectors as columns:
+%
+%       H * G = 2*pi*I
+%
+%   Reciprocal vectors are generated as:
+%
+%       k_col = G * m_col
+%       k_row = k_col.'
+%
+% This function stores k-vectors as Nk x 3 Cartesian row vectors.
 
     narginchk(3, 4);
 
@@ -104,14 +100,13 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
         boundary = lower(char(string(ewaldParams.boundary)));
     end
 
-    H = local_get_direct_lattice(sys);
-    V = abs(det(H));
-    if V <= 1e-14
-        error('geom:build_periodic_kspace_cache:SingularCell', ...
-            'Direct lattice matrix must have nonzero volume.');
-    end
+    lat = geom.get_lattice(sys);
 
-    [kvecs, meta] = ewald.enumerate_kvecs_triclinic(H, kcut);
+    H = lat.H;
+    G = lat.G;
+    V = lat.volume;
+
+    [kvecs, meta] = ewald.enumerate_kvecs_from_lattice(lat, kcut);
     nk = size(kvecs, 1);
 
     fullToActive = zeros(nSites, 1);
@@ -134,11 +129,13 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
 
     kCache = struct();
     kCache.mode = 'periodic_kspace';
+    kCache.lattice_convention = 'H_rows_G_columns_HG_2piI';
     kCache.nSites = nSites;
     kCache.nPolSites = nPolSites;
     kCache.activeSites = activeSites;
     kCache.full_to_active = fullToActive;
     kCache.H = H;
+    kCache.G = G;
     kCache.V = V;
     kCache.alpha = alpha;
     kCache.kcut = kcut;
@@ -155,6 +152,7 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
         kCache.kvecs_T = zeros(3, 0);
         kCache.k2 = zeros(0, 1);
         kCache.knorm = zeros(0, 1);
+        kCache.hkl = zeros(0, 3);
         kCache.pref = zeros(0, 1);
         kCache.two_pref = zeros(0, 1);
         kCache.kk6 = zeros(0, 6);
@@ -191,6 +189,7 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
     kCache.kvecs_T = kvecs.';
     kCache.k2 = k2;
     kCache.knorm = knorm;
+    kCache.hkl = meta.hkl;
     kCache.pref = pref;
     kCache.two_pref = two_pref;
     kCache.kk6 = kk6;
@@ -205,6 +204,7 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
 
             [blockStart, blockEnd, blocks] = local_make_blocks( ...
                 kvecs, pref, two_pref, k_block_size, pos_pol, false);
+
             kCache.num_blocks = numel(blockStart);
             kCache.block_start = blockStart;
             kCache.block_end = blockEnd;
@@ -222,6 +222,7 @@ function kCache = build_periodic_kspace_cache(sys, problem, ewaldParams, opts)
 
             [blockStart, blockEnd, blocks] = local_make_blocks( ...
                 kvecs, pref, two_pref, k_block_size, pos_pol, true);
+
             kCache.num_blocks = numel(blockStart);
             kCache.block_start = blockStart;
             kCache.block_end = blockEnd;
@@ -293,6 +294,7 @@ function blk = local_empty_block(nPolSites)
     if nargin < 1
         nPolSites = 0;
     end
+
     blk = struct( ...
         'idx', zeros(1, 0), ...
         'kvecs', zeros(0, 3), ...
@@ -302,18 +304,4 @@ function blk = local_empty_block(nPolSites)
         'nk', 0, ...
         'cos_phase', zeros(nPolSites, 0), ...
         'sin_phase', zeros(nPolSites, 0));
-end
-
-function H = local_get_direct_lattice(sys)
-    if isfield(sys, 'super_lattice') && ~isempty(sys.super_lattice)
-        H = sys.super_lattice;
-    elseif isfield(sys, 'lattice') && ~isempty(sys.lattice)
-        H = sys.lattice;
-    else
-        error('geom:build_periodic_kspace_cache:MissingLattice', ...
-            'sys.super_lattice or sys.lattice is required for periodic reciprocal-space cache.');
-    end
-
-    validateattributes(H, {'double'}, {'size', [3, 3], 'finite', 'real'}, ...
-        mfilename, 'lattice');
 end
