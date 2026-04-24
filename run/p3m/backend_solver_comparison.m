@@ -8,10 +8,14 @@
 %
 %   B. Matrix-free GMRES/Krylov backend using:
 %        - same real-space row cache
-%        - production P3M reciprocal dipole operator
+%        - cached P3M reciprocal dipole operator
 %        - Ewald self/surface terms
 %
-% Requires the project lattice convention:
+% Requires:
+%   p3m.build_dipole_cache
+%   p3m.apply_dipole_cache
+%
+% Project lattice convention:
 %
 %   H rows are direct lattice vectors:
 %
@@ -20,15 +24,10 @@
 %   G columns are reciprocal lattice vectors:
 %
 %       H * G = 2*pi*I
-%
-% and geom.get_lattice must accept:
-%   - sys structs
-%   - raw 3x3 H matrices
-%   - existing lat structs with fields .H and .G
 
 clear; clc; close all;
 
-fprintf('=== backend solver comparison: SOR/kCache vs P3M reciprocal GMRES ===\n');
+fprintf('=== backend solver comparison: SOR/kCache vs cached P3M reciprocal GMRES ===\n');
 
 %% ------------------------------------------------------------------------
 % User controls
@@ -62,14 +61,14 @@ cfg.p3mEext.derivative_mode = 'spectral';
 cfg.p3mEext.influence_mode = 'ewald';
 cfg.p3mEext.verbose = true;
 
-% P3M reciprocal dipole field used in GMRES matvec.
+% Cached P3M reciprocal dipole field used in GMRES matvec.
 cfg.p3mDipole = struct();
 cfg.p3mDipole.mesh_size = [40 64 40];
 cfg.p3mDipole.assignment_order = 4;
 cfg.p3mDipole.deconvolve_assignment = true;
 cfg.p3mDipole.deconvolution_floor = 1e-6;
 cfg.p3mDipole.use_kcut_mask = true;
-cfg.p3mDipole.verbose = false;
+cfg.p3mDipole.verbose = true;
 
 % Existing periodic SOR reference.
 cfg.sor = struct();
@@ -180,7 +179,7 @@ lat2 = geom.get_lattice(lat);
 fprintf('\nLattice convention:\n');
 fprintf('  max |H*G - 2*pi*I|       = %.16e\n', ...
     max(abs(lat.H * lat.G - 2*pi*eye(3)), [], 'all'));
-fprintf('  max |lat2.H*lat2.G - I|  = %.16e\n', ...
+fprintf('  max |lat2.H*lat2.G - 2*pi*I| = %.16e\n', ...
     max(abs(lat2.H * lat2.G - 2*pi*eye(3)), [], 'all'));
 
 targetMask = logical(polsys.site_is_polarizable(:));
@@ -288,6 +287,29 @@ sorParams.realspace_dipole_row_cache = rowCache;
 sorParams.kspace_cache = kCache;
 
 %% ------------------------------------------------------------------------
+% Build P3M dipole cache
+
+fprintf('\n[setup] building P3M dipole cache...\n');
+
+p3mDipoleCacheOpts = struct();
+p3mDipoleCacheOpts.ewald = cfg.ewald;
+p3mDipoleCacheOpts.mesh_size = cfg.p3mDipole.mesh_size;
+p3mDipoleCacheOpts.assignment_order = cfg.p3mDipole.assignment_order;
+p3mDipoleCacheOpts.target_mask = targetMask;
+p3mDipoleCacheOpts.source_mask = targetMask;
+p3mDipoleCacheOpts.deconvolve_assignment = cfg.p3mDipole.deconvolve_assignment;
+p3mDipoleCacheOpts.deconvolution_floor = cfg.p3mDipole.deconvolution_floor;
+p3mDipoleCacheOpts.use_kcut_mask = cfg.p3mDipole.use_kcut_mask;
+p3mDipoleCacheOpts.verbose = cfg.p3mDipole.verbose;
+
+tP3MCache = tic;
+p3mDipoleCache = p3m.build_dipole_cache(polsys, p3mDipoleCacheOpts);
+timeP3MCache = toc(tP3MCache);
+
+fprintf('  P3M dipole cache time = %.6f s\n', timeP3MCache);
+fprintf('  P3M dipole cache nK   = %d\n', p3mDipoleCache.nK);
+
+%% ------------------------------------------------------------------------
 % Reference existing periodic SOR
 
 fprintf('\n============================================================\n');
@@ -317,7 +339,7 @@ fprintf('MATVEC DIAGNOSTIC AT REFERENCE SOR MU\n');
 fprintf('============================================================\n');
 
 diagRef = local_operator_diagnostic_at_mu( ...
-    polsys, lat, Eext, targetMask, rowCache, muRef, cfg.ewald, cfg.p3mDipole);
+    polsys, lat, Eext, targetMask, rowCache, p3mDipoleCache, muRef, cfg.ewald);
 
 fprintf('Operator field norms at muRef:\n');
 fprintf('  ||EopNeeded||_F       = %.16e\n', diagRef.normNeeded);
@@ -348,17 +370,17 @@ fprintf('  -1/2 mu.EopLocal  = %+0.8f eV\n', diagRef.UlocalEV);
 % P3M reciprocal backend Krylov solve
 
 fprintf('\n============================================================\n');
-fprintf('P3M reciprocal backend Krylov solve\n');
+fprintf('Cached P3M reciprocal backend Krylov solve\n');
 fprintf('============================================================\n');
 
 tP3M = tic;
 [muP3M, infoP3M] = local_solve_scf_periodic_p3m_gmres( ...
-    polsys, lat, Eext, problem, rowCache, cfg.ewald, cfg.p3mDipole, cfg.krylov);
+    polsys, lat, Eext, problem, rowCache, p3mDipoleCache, cfg.ewald, cfg.krylov);
 timeP3M = toc(tP3M);
 
 [Ep3mHa, Ep3mEV] = local_stationary_energy(targetMask, muP3M, Eext);
 
-fprintf('\nP3M Krylov result:\n');
+fprintf('\nCached P3M Krylov result:\n');
 fprintf('  time      = %.6f s\n', timeP3M);
 fprintf('  converged = %d\n', infoP3M.converged);
 fprintf('  flag      = %d\n', infoP3M.flag);
@@ -389,10 +411,11 @@ fprintf('\n============================================================\n');
 fprintf('BACKEND COMPARISON SUMMARY\n');
 fprintf('============================================================\n');
 
-fprintf('External field:\n');
+fprintf('External field / setup:\n');
 fprintf('  P3M Eext time                 = %.6f s\n', timeEext);
 fprintf('  row cache build time          = %.6f s\n', timeRow);
 fprintf('  kCache build time             = %.6f s\n', timeK);
+fprintf('  P3M dipole cache build time   = %.6f s\n', timeP3MCache);
 
 fprintf('\nReference SOR:\n');
 fprintf('  time                          = %.6f s\n', timeRef);
@@ -400,7 +423,7 @@ fprintf('  converged / nIter / relres    = %d / %d / %.3e\n', ...
     infoRef.converged, infoRef.nIter, infoRef.relres);
 fprintf('  energy                        = %+0.8f eV\n', ErefEV);
 
-fprintf('\nP3M Krylov:\n');
+fprintf('\nCached P3M Krylov:\n');
 fprintf('  time                          = %.6f s\n', timeP3M);
 fprintf('  converged / iter / relres     = %d / %s / %.3e\n', ...
     infoP3M.converged, mat2str(infoP3M.iter), infoP3M.relres);
@@ -419,7 +442,7 @@ fprintf('  max site |dmu|                = %.16e au = %.8e D\n', ...
 fprintf('  RMS site |muRef|              = %.16e au = %.8e D\n', ...
     sqrt(mean(siteRefMag.^2)), sqrt(mean(siteRefMag.^2))*2.541746473);
 
-fprintf('\nP3M timing breakdown:\n');
+fprintf('\nCached P3M timing breakdown:\n');
 fprintf('  total real apply time         = %.6f s\n', infoP3M.timeRealApply);
 fprintf('  total P3M reciprocal time     = %.6f s\n', infoP3M.timeP3MRecip);
 fprintf('  total self/surface time       = %.6f s\n', infoP3M.timeSelfSurf);
@@ -435,7 +458,7 @@ fprintf('\nDone.\n');
 %% ========================================================================
 
 function [mu, info] = local_solve_scf_periodic_p3m_gmres( ...
-    sys, lat, Eext, problem, rowCache, ewaldParams, p3mOpts, krylovOpts)
+    sys, lat, Eext, problem, rowCache, p3mDipoleCache, ewaldParams, krylovOpts)
 
     polSites = local_get_problem_pol_sites(problem, sys);
     nPol = numel(polSites);
@@ -462,10 +485,13 @@ function [mu, info] = local_solve_scf_periodic_p3m_gmres( ...
     timeSelfSurf = 0.0;
 
     if verbose
-        fprintf('GMRES(P3M periodic backend): nPol=%d, nDOF=%d, restart=%d, maxOuter=%d, tol=%.3e\n', ...
+        fprintf('GMRES(cached P3M periodic backend): nPol=%d, nDOF=%d, restart=%d, maxOuter=%d, tol=%.3e\n', ...
             nPol, 3*nPol, restart, maxOuter, tol);
         fprintf('  Ewald dipole selfCoeff = %.16e\n', selfCoeff);
         fprintf('  Ewald dipole surfCoeff = %.16e\n', surfCoeff);
+        fprintf('  P3M cache mesh         = [%d %d %d]\n', p3mDipoleCache.mesh_size);
+        fprintf('  P3M cache order        = %d\n', p3mDipoleCache.assignment_order);
+        fprintf('  P3M cache nK           = %d\n', p3mDipoleCache.nK);
     end
 
     Afun = @(x) local_matvec_A(x);
@@ -528,22 +554,7 @@ function [mu, info] = local_solve_scf_periodic_p3m_gmres( ...
         muTrialFull(polSites, :) = muTrialPol;
 
         tP3M = tic;
-
-        p3mDipoleOpts = struct();
-        p3mDipoleOpts.ewald = ewaldParams;
-        p3mDipoleOpts.mesh_size = p3mOpts.mesh_size;
-        p3mDipoleOpts.assignment_order = p3mOpts.assignment_order;
-        p3mDipoleOpts.target_mask = sys.site_is_polarizable(:);
-        p3mDipoleOpts.source_mask = sys.site_is_polarizable(:);
-        p3mDipoleOpts.deconvolve_assignment = local_get_opt(p3mOpts, 'deconvolve_assignment', true);
-        p3mDipoleOpts.deconvolution_floor = local_get_opt(p3mOpts, 'deconvolution_floor', 1e-8);
-        p3mDipoleOpts.use_kcut_mask = local_get_opt(p3mOpts, 'use_kcut_mask', true);
-        p3mDipoleOpts.kcut = ewaldParams.kcut;
-        p3mDipoleOpts.verbose = false;
-
-        [ErecipFull, ~] = p3m.compute_induced_field_dipoles( ...
-            sys, muTrialFull, p3mDipoleOpts);
-
+        [ErecipFull, ~] = p3m.apply_dipole_cache(p3mDipoleCache, muTrialFull);
         timeP3MRecip = timeP3MRecip + toc(tP3M);
 
         ErecipPol = ErecipFull(polSites, :);
@@ -567,7 +578,7 @@ function [mu, info] = local_solve_scf_periodic_p3m_gmres( ...
 end
 
 function diag = local_operator_diagnostic_at_mu( ...
-    sys, lat, Eext, targetMask, rowCache, mu, ewaldParams, p3mOpts)
+    sys, lat, Eext, targetMask, rowCache, p3mDipoleCache, mu, ewaldParams)
 
     polSites = find(targetMask);
     alphaPol = sys.site_alpha(polSites);
@@ -583,19 +594,7 @@ function diag = local_operator_diagnostic_at_mu( ...
 
     ErealPol = local_apply_dipole_row_cache(rowCache, muPol);
 
-    p3mDipoleOpts = struct();
-    p3mDipoleOpts.ewald = ewaldParams;
-    p3mDipoleOpts.mesh_size = p3mOpts.mesh_size;
-    p3mDipoleOpts.assignment_order = p3mOpts.assignment_order;
-    p3mDipoleOpts.target_mask = targetMask;
-    p3mDipoleOpts.source_mask = targetMask;
-    p3mDipoleOpts.deconvolve_assignment = local_get_opt(p3mOpts, 'deconvolve_assignment', true);
-    p3mDipoleOpts.deconvolution_floor = local_get_opt(p3mOpts, 'deconvolution_floor', 1e-8);
-    p3mDipoleOpts.use_kcut_mask = local_get_opt(p3mOpts, 'use_kcut_mask', true);
-    p3mDipoleOpts.kcut = ewaldParams.kcut;
-    p3mDipoleOpts.verbose = false;
-
-    [ErecipFull, ~] = p3m.compute_induced_field_dipoles(sys, mu, p3mDipoleOpts);
+    [ErecipFull, ~] = p3m.apply_dipole_cache(p3mDipoleCache, mu);
     ErecipPol = ErecipFull(polSites, :);
 
     EselfPol = selfCoeff .* muPol;
