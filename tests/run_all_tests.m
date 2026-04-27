@@ -30,7 +30,7 @@ end
 
 addpath(testDir);
 
-files = dir(fullfile(testDir, 'test_*.m'));
+files = dir(fullfile(testDir, '**', 'test_*.m'));
 
 if isempty(files)
     fprintf('\nNo test_*.m files found in:\n  %s\n', testDir);
