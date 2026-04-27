@@ -78,7 +78,10 @@ addParameter(p, 'ZeroExistingCharges', false, @(x) islogical(x) && isscalar(x));
 addParameter(p, 'RequireComplete', true, @(x) islogical(x) && isscalar(x));
 addParameter(p, 'ChargeFile', '', @(x) ischar(x) || isstring(x));
 addParameter(p, 'Template', struct(), @isstruct);
-addParameter(p, 'DistanceTol', 1e-3, @(x) isnumeric(x) && isscalar(x) && x > 0);
+addParameter(p, 'DistanceTol', 0.2, @(x) isnumeric(x) && isscalar(x) && x > 0);
+addParameter(p, 'ReferenceAxis', [0 0 1], @(x) isnumeric(x) && numel(x) == 3 && norm(x) > 0);
+addParameter(p, 'PrimaryAxis', [1 0 0], @(x) isnumeric(x) && numel(x) == 3 && norm(x) > 0);
+addParameter(p, 'AmbiguityTol', 1e-10, @(x) isnumeric(x) && isscalar(x) && x >= 0);
 addParameter(p, 'Verbose', false, @(x) islogical(x) && isscalar(x));
 parse(p, sys, molIDs, varargin{:});
 
@@ -219,9 +222,14 @@ for k = 1:numel(molIDs)
     target.site_type = local_to_cell_column(sys.site_type(idx));
 
     map = builder.match_molecule_atoms_by_frame(template, target, ...
-        'DistanceTol', opt.DistanceTol);
-
-    q = template.site_charge(map.template_to_target);
+        'DistanceTol', opt.DistanceTol, ...
+        'ReferenceAxis', opt.ReferenceAxis, ...
+        'PrimaryAxis', opt.PrimaryAxis, ...
+        'AmbiguityTol', opt.AmbiguityTol);
+    
+    % q must be in target-site order. target_to_template(j) gives the template
+    % atom corresponding to target atom j.
+    q = template.site_charge(map.target_to_template);
 
     % If TotalCharges was supplied, rescale template charges to requested
     % total molecular charge.
