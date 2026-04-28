@@ -3,60 +3,115 @@ function op = make_polarization_operator(sys, problem, varargin)
 %
 % op = thole.make_polarization_operator(sys, problem, Name, Value)
 %
-% The operator object standardizes how solvers access the dipole-dipole
-% interaction operator T. Dense, matrix-free, periodic, and future P3M
-% backends should all present a consistent interface.
+% Public options
+%   'Mode'
+%       'nonperiodic', 'periodic_ewald', 'periodic_p3m'
+%       default: inferred from sys.is_periodic
 %
-% Currently supported:
+%   'Solver'
+%       'direct', 'jacobi', 'gmres', 'sor'
+%       default: 'direct'
 %
-%   Mode    = 'nonperiodic'
-%   Backend = 'dense'
-%
-% Options
-%   'Mode'       'nonperiodic' | 'periodic_ewald' | 'periodic_p3m'
-%                default: inferred from sys.is_periodic, otherwise nonperiodic
-%
-%   'Backend'    'dense' | future backends
-%                default: 'dense'
+%   'Backend'
+%       'auto', 'dense', 'matrix_free'
+%       default: 'auto'
 %
 %   'UseThole'   logical, default true
 %   'Softening'  scalar, default 0
 %   'Rcut'       scalar cutoff in bohr, default Inf
+%   'UseMex'     logical, default true
+%   'Profile'    logical, default false
 %   'Verbose'    logical, default false
 %
-% Output op fields
-%   .mode
-%   .backend
-%   .kind
-%   .nPolSites
-%   .size
-%   .apply
-%   .info
+% Operator fields
+%   op.kind
+%       Broad representation class used by solvers:
+%           'dense_matrix'
+%           'matrix_free'
 %
-% Dense backend additionally contains:
-%   .Tpol
+%   op.backend
+%       Concrete implementation:
+%           'nonperiodic_paircache_dense'
+%           'nonperiodic_allpairs_dense'
+%           'nonperiodic_paircache_apply'
+%
+% Current support
+%   nonperiodic + direct + auto/dense
+%   nonperiodic + jacobi/gmres + auto/matrix_free with finite Rcut
+%   nonperiodic + jacobi/gmres + dense
+%
+% SOR row-cache support will be added as another private backend builder.
 
 p = inputParser;
 addRequired(p, 'sys', @isstruct);
 addRequired(p, 'problem', @isstruct);
+
 addParameter(p, 'Mode', '', @(x) ischar(x) || isstring(x));
-addParameter(p, 'Backend', 'dense', @(x) ischar(x) || isstring(x));
+addParameter(p, 'Solver', 'direct', @(x) ischar(x) || isstring(x));
+addParameter(p, 'Backend', 'auto', @(x) ischar(x) || isstring(x));
+
 addParameter(p, 'UseThole', true, @(x) islogical(x) && isscalar(x));
 addParameter(p, 'Softening', 0.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x >= 0);
 addParameter(p, 'Rcut', Inf, @(x) isnumeric(x) && isscalar(x) && x > 0);
-addParameter(p, 'Verbose', false, @(x) islogical(x) && isscalar(x));
-parse(p, sys, problem, varargin{:});
 
+addParameter(p, 'UseMex', true, @(x) islogical(x) && isscalar(x));
+addParameter(p, 'Profile', false, @(x) islogical(x) && isscalar(x));
+addParameter(p, 'Verbose', false, @(x) islogical(x) && isscalar(x));
+
+parse(p, sys, problem, varargin{:});
 opt = p.Results;
 
-mode = lower(strtrim(char(string(opt.Mode))));
-backend = lower(strtrim(char(string(opt.Backend))));
-
-if isempty(mode)
-    mode = local_infer_mode(sys);
-end
+mode = local_normalize_mode(opt.Mode, sys);
+solver = local_normalize_solver(opt.Solver);
+backendRequest = local_normalize_backend_request(opt.Backend);
 
 validate_problem(problem);
+
+if ~strcmp(mode, 'nonperiodic')
+    error('thole:make_polarization_operator:UnsupportedOperatorMode', ...
+        ['Unsupported polarization operator mode "%s" in this refactor stage. ', ...
+         'Currently supported: mode="nonperiodic".'], mode);
+end
+
+backendResolved = local_resolve_backend(mode, solver, backendRequest, opt.Rcut);
+
+switch backendResolved
+    case 'dense'
+        op = build_nonperiodic_dense_operator(sys, problem, opt);
+
+    case 'matrix_free_paircache'
+        op = build_nonperiodic_paircache_operator(sys, problem, opt);
+
+    case 'matrix_free_rowcache'
+        op = build_nonperiodic_rowcache_operator(sys, problem, opt);
+
+    otherwise
+        error('thole:make_polarization_operator:InternalBadBackendResolution', ...
+            'Internal error: unresolved backend "%s".', backendResolved);
+end
+
+op.request = struct();
+op.request.mode = mode;
+op.request.solver = solver;
+op.request.backend = backendRequest;
+
+end
+
+% =========================================================================
+% Resolution / validation
+% =========================================================================
+
+function mode = local_normalize_mode(modeIn, sys)
+
+mode = lower(strtrim(char(string(modeIn))));
+
+if isempty(mode)
+    if isfield(sys, 'is_periodic') && ~isempty(sys.is_periodic) && logical(sys.is_periodic)
+        mode = 'periodic_ewald';
+    else
+        mode = 'nonperiodic';
+    end
+end
 
 switch mode
     case {'nonperiodic', 'finite', 'cluster'}
@@ -69,72 +124,132 @@ switch mode
         mode = 'periodic_p3m';
 
     otherwise
-        error('thole:make_polarization_operator:UnsupportedMode', ...
-            ['Unsupported polarization-operator mode "%s". Supported modes are: ', ...
-             '"nonperiodic", "periodic_ewald", and future "periodic_p3m".'], mode);
+        error('thole:make_polarization_operator:UnsupportedOperatorMode', ...
+            'Unsupported polarization-operator mode "%s".', mode);
 end
 
+end
+
+function solver = local_normalize_solver(solverIn)
+
+solver = lower(strtrim(char(string(solverIn))));
+
+switch solver
+    case {'direct', 'dense_direct'}
+        solver = 'direct';
+
+    case {'jacobi', 'iterative', 'fixed_point'}
+        solver = 'jacobi';
+
+    case {'gmres', 'krylov'}
+        solver = 'gmres';
+
+    case {'sor', 'gauss_seidel'}
+        solver = 'sor';
+
+    otherwise
+        error('thole:make_polarization_operator:UnsupportedSolver', ...
+            ['Unsupported solver "%s". Supported solver intents are: ', ...
+             '"direct", "jacobi", "gmres", "sor".'], solver);
+end
+
+end
+
+function backend = local_normalize_backend_request(backendIn)
+
+backend = lower(strtrim(char(string(backendIn))));
+
 switch backend
+    case {'auto', ''}
+        backend = 'auto';
+
     case {'dense', 'dense_matrix'}
         backend = 'dense';
 
-    case {'pair_cache', 'matrix_free', 'ewald_direct', 'p3m'}
-        % Recognized names, but not implemented in Operator-1.
-        error('thole:make_polarization_operator:UnsupportedOperatorBackend', ...
-            ['Unsupported polarization operator mode/backend combination: ', ...
-             'mode="%s", backend="%s". Currently supported: ', ...
-             'mode="nonperiodic", backend="dense".'], mode, backend);
+    case {'matrix_free', 'matrixfree'}
+        backend = 'matrix_free';
+
+    case {'pair_cache', 'paircache'}
+        error('thole:make_polarization_operator:PairCacheBackendRenamed', ...
+            ['Backend="pair_cache" has been replaced by Backend="matrix_free". ', ...
+             'The pair cache is an internal implementation detail of the nonperiodic matrix-free operator.']);
 
     otherwise
         error('thole:make_polarization_operator:UnsupportedOperatorBackend', ...
-            ['Unsupported polarization-operator backend "%s". Currently supported: ', ...
-             'backend="dense" for mode="nonperiodic".'], backend);
+            ['Unsupported Backend="%s". Supported public backend values are: ', ...
+             '"auto", "dense", "matrix_free".'], backend);
 end
 
-if strcmp(mode, 'nonperiodic') && strcmp(backend, 'dense')
-    scfParams = struct();
-    scfParams.use_thole = opt.UseThole;
-    scfParams.softening = opt.Softening;
-    scfParams.rcut = opt.Rcut;
-    scfParams.verbose = opt.Verbose;
+end
 
-    [Tpol, info] = thole.assemble_nonperiodic_interaction_matrix(sys, problem, scfParams);
+function backend = local_resolve_backend(mode, solver, backendRequest, rcut)
 
-    op = struct();
-    op.mode = 'nonperiodic';
-    op.backend = 'dense';
-    op.kind = 'dense_matrix';
-    op.nPolSites = problem.nPolSites;
-    op.size = size(Tpol);
-    op.Tpol = Tpol;
-    op.apply = @(muVec) Tpol * muVec;
-    op.info = info;
+if ~strcmp(mode, 'nonperiodic')
+    error('thole:make_polarization_operator:UnsupportedOperatorMode', ...
+        'Only mode="nonperiodic" is currently supported.');
+end
 
-    op.params = struct();
-    op.params.use_thole = opt.UseThole;
-    op.params.softening = opt.Softening;
-    op.params.rcut = opt.Rcut;
+if strcmp(backendRequest, 'dense')
+    if strcmp(solver, 'sor')
+        error('thole:make_polarization_operator:SorRequiresMatrixFreeRowUpdate', ...
+            ['SOR requires a matrix-free operator with row-update capability. ', ...
+             'Backend="dense" is not compatible with SOR.']);
+    end
+
+    backend = 'dense';
+    return;
+end
+
+if strcmp(backendRequest, 'matrix_free')
+    if strcmp(solver, 'direct')
+        error('thole:make_polarization_operator:DirectRequiresDenseOperator', ...
+            ['Direct SCF requires a dense operator with op.Tpol. ', ...
+             'Use Backend="dense" or Backend="auto" with Solver="direct".']);
+    end
+
+    if ~isfinite(rcut)
+        error('thole:make_polarization_operator:MatrixFreeRequiresFiniteCutoff', ...
+            ['Nonperiodic matrix-free operator construction currently requires a finite Rcut. ', ...
+             'Use Backend="dense" for full all-pairs calculations, or provide a finite Rcut.']);
+    end
+
+    if strcmp(solver, 'sor')
+        backend = 'matrix_free_rowcache';
+    else
+        backend = 'matrix_free_paircache';
+    end
 
     return;
 end
 
-error('thole:make_polarization_operator:UnsupportedOperatorBackend', ...
-    ['Unsupported polarization operator mode/backend combination: ', ...
-     'mode="%s", backend="%s". Currently supported: ', ...
-     'mode="nonperiodic", backend="dense".'], mode, backend);
+% Backend = auto
+switch solver
+    case 'direct'
+        backend = 'dense';
 
-end
+    case {'jacobi', 'gmres'}
+        if ~isfinite(rcut)
+            error('thole:make_polarization_operator:AutoMatrixFreeRequiresFiniteCutoff', ...
+                ['Backend="auto" with Solver="%s" resolves to a matrix-free operator, ', ...
+                 'which currently requires a finite Rcut for nonperiodic systems. ', ...
+                 'Use Backend="dense" for full all-pairs calculations, or provide a finite Rcut.'], solver);
+        end
 
-% =========================================================================
-% Helpers
-% =========================================================================
+        backend = 'matrix_free_paircache';
 
-function mode = local_infer_mode(sys)
+    case 'sor'
+        if ~isfinite(rcut)
+            error('thole:make_polarization_operator:SorRequiresFiniteCutoff', ...
+                ['Backend="auto" with Solver="sor" resolves to a matrix-free row-cache operator, ', ...
+                 'which currently requires a finite Rcut for nonperiodic systems. ', ...
+                 'Provide a finite Rcut.']);
+        end
 
-if isfield(sys, 'is_periodic') && ~isempty(sys.is_periodic) && logical(sys.is_periodic)
-    mode = 'periodic_ewald';
-else
-    mode = 'nonperiodic';
+        backend = 'matrix_free_rowcache';
+
+    otherwise
+        error('thole:make_polarization_operator:UnsupportedSolver', ...
+            'Unsupported solver "%s".', solver);
 end
 
 end
