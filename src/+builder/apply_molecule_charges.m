@@ -127,8 +127,19 @@ if opt.DisablePolarizabilityOnCharged
     for k = 1:numel(molIDs)
         idx = builder.site_indices_for_molecule(sys, molIDs(k));
 
+        % Remove charged molecule sites from the induced-dipole active
+        % space, but preserve their physical site_alpha values.
+        %
+        % prepare_scf_problem uses site_is_polarizable to decide which
+        % sites participate as induced dipoles, so zeroing site_alpha is
+        % not needed for SCF exclusion.
+        %
+        % Keeping site_alpha is important for Thole-damped external fields:
+        % charge -> polarizable-site damping uses both source and target
+        % alpha values. If charged source-site alpha is zeroed here, then
+        % fieldParams.use_thole_damping=true cannot actually apply the
+        % short-range Thole correction for charged source sites.
         sys.site_is_polarizable(idx) = false;
-        sys.site_alpha(idx) = 0;
     end
 end
 

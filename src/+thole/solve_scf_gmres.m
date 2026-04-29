@@ -132,7 +132,24 @@ info.flag = flag;
 info.relres = scfRelres;
 info.gmres_relres = gmresRelres;
 
+% MATLAB gmres returns:
+%   iter = scalar      for unrestarted GMRES
+%   iter = [outer inner] for restarted GMRES
+%
+% Match the other solver info structs by exposing info.iterations as the
+% primary user-facing field, while keeping info.iter as a backward-compatible
+% raw MATLAB-GMRES alias.
 info.iter = iter;
+if isempty(iter)
+    info.iterations = 0;
+elseif isscalar(iter)
+    info.iterations = iter;
+else
+    info.iterations = iter(1);
+    info.inner_iterations = iter(2);
+    info.total_inner_iterations = (iter(1) - 1) * restart + iter(2);
+end
+
 info.resvec = resvec;
 
 info.tol = tol;
