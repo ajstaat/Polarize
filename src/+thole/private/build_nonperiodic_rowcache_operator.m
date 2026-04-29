@@ -150,6 +150,29 @@ op.row_cache.row_ptr = rowPtr;
 op.row_cache.col_idx = colIdx;
 op.row_cache.n_entries = nEntries;
 
+% Raw row-cache arrays used by solve_scf_sor fast path.
+%
+% This mirrors the old matrix-free SOR implementation: the solver performs
+% the contraction from dr/f3/f5/invR3/invR5 directly inside the row sweep.
+% That is faster for SOR than calling op.apply_row per row or using the
+% precomputed tensor-coefficient path.
+op.row_cache.dr = dr;
+op.row_cache.r2_bare = r2Bare;
+op.row_cache.r_bare = rBare;
+op.row_cache.inv_r3_bare = invR3;
+op.row_cache.inv_r5_bare = invR5;
+op.row_cache.thole_f3 = f3;
+op.row_cache.thole_f5 = f5;
+
+% Tensor coefficients are retained for op.apply/op.apply_row and tests.
+% solve_scf_sor no longer uses these for its production fast path.
+op.row_cache.Txx = Txx;
+op.row_cache.Txy = Txy;
+op.row_cache.Txz = Txz;
+op.row_cache.Tyy = Tyy;
+op.row_cache.Tyz = Tyz;
+op.row_cache.Tzz = Tzz;
+
 op.info = struct();
 op.info.assembly_backend = 'nonperiodic_rowcache_apply';
 op.info.nPolSites = nPol;

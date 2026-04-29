@@ -11,66 +11,16 @@ function energy = compute_total_energy_active_space(sys, problem, mu, Eext, opOr
 %     -       mu' * Eext
 %     - 0.5 * mu' * T * mu
 %
-% where all vectors are active-space stacked xyz vectors.
+% The final T*mu action may come from either:
+%   - a dense active-space Tpol matrix
+%   - an operator struct with op.apply(muVec)
 %
-% The function also reports the stationary-form consistency check:
-%
-% At self-consistency,
-%
-%   A^{-1} mu = Eext + T mu
-%
-% therefore
-%
-%   E_pol = -0.5 * mu' * Eext
-%
-% In code:
-%
-%   external_charge_dipole = -mu' * Eext
-%   total_stationary      = 0.5 * external_charge_dipole
-%
-% Inputs
-%   sys
-%       polarization system in atomic units
-%
-%   problem
-%       struct from thole.prepare_scf_problem
-%
-%   mu
-%       full-system N x 3 induced dipoles
-%
-%   Eext
-%       full-system N x 3 external field
-%
-%   Tpol
-%       dense active-space dipole interaction matrix
-%
-%   op
-%       dense operator struct from thole.make_polarization_operator
-%
-% Output
-%   energy struct with fields:
-%       polarization_self
-%       external_charge_dipole
-%       dipole_dipole
-%       total
-%       total_stationary
-%       stationary_consistency
-%       relres
-%       nPolSites
-%       units
+% This allows large matrix-free workflows to compute energy without
+% materializing dense Tpol.
 
 validate_inputs(sys, problem, mu, Eext);
 
-Tpol = local_extract_Tpol_for_energy(opOrTpol);
-
 io.assert_atomic_units(sys);
-
-nVec = numel(problem.Eext_pol_vec);
-
-if ~isequal(size(Tpol), [nVec nVec])
-    error('calc:compute_total_energy_active_space:BadTpolSize', ...
-        'Tpol must be %d x %d for this active-space problem.', nVec, nVec);
-end
 
 activeSites = problem.activeSites(:);
 
@@ -87,11 +37,20 @@ if any(alphaVec <= 0)
         'All active-space alpha values must be positive for energy evaluation.');
 end
 
+nVec = numel(problem.Eext_pol_vec);
+
+if numel(muVec) ~= nVec
+    error('calc:compute_total_energy_active_space:BadMuVecSize', ...
+        'Active-space mu vector length must equal problem.Eext_pol_vec length.');
+end
+
+TmuVec = local_apply_T(opOrTpol, muVec, nVec);
+
 AinvVec = 1 ./ alphaVec;
 
 polarizationSelf = 0.5 * sum((muVec.^2) .* AinvVec);
 externalChargeDipole = -dot(muVec, EextVec);
-dipoleDipole = -0.5 * dot(muVec, Tpol * muVec);
+dipoleDipole = -0.5 * dot(muVec, TmuVec);
 
 total = polarizationSelf + externalChargeDipole + dipoleDipole;
 
@@ -115,7 +74,7 @@ total = polarizationSelf + externalChargeDipole + dipoleDipole;
 totalStationary = 0.5 * externalChargeDipole;
 stationaryConsistency = total - totalStationary;
 
-relres = thole.compute_active_space_relres(problem, Tpol, mu);
+relres = local_compute_relres(problem, opOrTpol, mu, muVec, TmuVec);
 
 energy = struct();
 energy.polarization_self = polarizationSelf;
@@ -134,6 +93,92 @@ energy.units.energy = 'hartree';
 energy.units.length = 'bohr';
 energy.units.alpha = 'atomic_unit';
 energy.units.charge = 'elementary_charge';
+
+end
+
+% =========================================================================
+% Operator helpers
+% =========================================================================
+
+function TmuVec = local_apply_T(opOrTpol, muVec, nVec)
+
+if isnumeric(opOrTpol)
+    Tpol = opOrTpol;
+
+    if ~isequal(size(Tpol), [nVec nVec])
+        error('calc:compute_total_energy_active_space:BadTpolSize', ...
+            'Tpol must be %d x %d for this active-space problem.', nVec, nVec);
+    end
+
+    TmuVec = Tpol * muVec;
+    return;
+end
+
+if ~isstruct(opOrTpol)
+    error('calc:compute_total_energy_active_space:BadOperator', ...
+        'Final input must be a dense Tpol matrix or an operator struct.');
+end
+
+if isfield(opOrTpol, 'kind') && strcmp(opOrTpol.kind, 'dense_matrix')
+    if ~isfield(opOrTpol, 'Tpol') || isempty(opOrTpol.Tpol)
+        error('calc:compute_total_energy_active_space:MissingDenseMatrix', ...
+            'Dense operator must contain op.Tpol.');
+    end
+
+    Tpol = opOrTpol.Tpol;
+
+    if ~isequal(size(Tpol), [nVec nVec])
+        error('calc:compute_total_energy_active_space:BadDenseOperatorMatrixSize', ...
+            'op.Tpol must be %d x %d for this active-space problem.', nVec, nVec);
+    end
+
+    TmuVec = Tpol * muVec;
+    return;
+end
+
+if isfield(opOrTpol, 'apply') && isa(opOrTpol.apply, 'function_handle')
+    TmuVec = opOrTpol.apply(muVec);
+
+    if numel(TmuVec) ~= nVec
+        error('calc:compute_total_energy_active_space:BadApplyOutputSize', ...
+            'op.apply(muVec) must return a vector of length %d.', nVec);
+    end
+
+    TmuVec = TmuVec(:);
+    return;
+end
+
+backend = '<unknown>';
+if isfield(opOrTpol, 'backend') && ~isempty(opOrTpol.backend)
+    backend = char(string(opOrTpol.backend));
+end
+
+error('calc:compute_total_energy_active_space:OperatorMissingApply', ...
+    ['Energy evaluation requires either dense op.Tpol or op.apply(muVec). ', ...
+     'Requested backend "%s" provides neither.'], backend);
+
+end
+
+function relres = local_compute_relres(problem, opOrTpol, mu, muVec, TmuVec)
+
+alphaVec = problem.alpha_pol_vec(:);
+Evec = problem.Eext_pol_vec(:);
+
+resVec = muVec - alphaVec .* (Evec + TmuVec);
+
+rhsScale = norm(alphaVec .* Evec);
+if rhsScale == 0
+    rhsScale = 1;
+end
+
+relres = norm(resVec) / rhsScale;
+
+% For dense/raw Tpol, this should match the canonical routine. Do not call
+% thole.compute_active_space_relres here because that routine currently
+% expects dense Tpol and would defeat matrix-free workflows.
+if nargin < 5 %#ok<UNRCH>
+    relres = thole.compute_active_space_relres(problem, opOrTpol, mu);
+end
 
 end
 
@@ -212,41 +257,6 @@ end
 if numel(problem.alpha_pol_vec) ~= nVec
     error('calc:compute_total_energy_active_space:BadAlphaPolVec', ...
         'problem.alpha_pol_vec must have length 3*problem.nPolSites.');
-end
-
-end
-
-function Tpol = local_extract_Tpol_for_energy(opOrTpol)
-
-if isnumeric(opOrTpol)
-    Tpol = opOrTpol;
-    return;
-end
-
-if ~isstruct(opOrTpol)
-    error('calc:compute_total_energy_active_space:BadOperator', ...
-        'Final input must be a dense Tpol matrix or an operator struct.');
-end
-
-if ~isfield(opOrTpol, 'kind') || ~strcmp(opOrTpol.kind, 'dense_matrix') || ...
-        ~isfield(opOrTpol, 'Tpol') || isempty(opOrTpol.Tpol)
-
-    backend = '<unknown>';
-    if isfield(opOrTpol, 'backend') && ~isempty(opOrTpol.backend)
-        backend = char(string(opOrTpol.backend));
-    end
-
-    error('calc:compute_total_energy_active_space:RequiresDenseOperator', ...
-        ['Active-space energy currently requires a dense operator with op.Tpol ', ...
-         'so it can evaluate mu''*T*mu. Requested backend "%s" is not dense. ', ...
-         'Later matrix-free backends should provide an energy/apply-compatible path.'], backend);
-end
-
-Tpol = opOrTpol.Tpol;
-
-if ~isnumeric(Tpol) || ndims(Tpol) ~= 2 || size(Tpol,1) ~= size(Tpol,2)
-    error('calc:compute_total_energy_active_space:BadDenseOperatorMatrix', ...
-        'op.Tpol must be a numeric square matrix.');
 end
 
 end

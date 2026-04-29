@@ -15,6 +15,24 @@ function [mu, info] = solve_scf_jacobi(problem, opOrTpol, opts)
 %
 % This solver requires only op.apply(muVec), so it can use dense or
 % matrix-free operators.
+%
+% Options:
+%   tol
+%       convergence tolerance, default problem.tol or 1e-10
+%
+%   max_iter
+%       maximum iterations, default problem.maxIter or 500
+%
+%   mixing
+%       linear mixing parameter in (0,1], default problem.mixing or 0.5
+%
+%   stop_metric
+%       'relres'  : stop on relative SCF residual
+%       'max_dmu' : stop on max per-site dipole update magnitude
+%       default: problem.stop_metric/problem.stopMetric or 'relres'
+%
+%   verbose
+%       logical, default false
 
 if nargin < 3 || isempty(opts)
     opts = struct();
@@ -27,6 +45,7 @@ op = local_normalize_operator(opOrTpol);
 tol = local_get_field(opts, 'tol', local_get_field(problem, 'tol', 1e-10));
 maxIter = local_get_field(opts, 'max_iter', local_get_field(problem, 'maxIter', 500));
 mixing = local_get_field(opts, 'mixing', local_get_field(problem, 'mixing', 0.5));
+stopMetric = local_normalize_stop_metric(local_get_field(opts, 'stop_metric', 'relres'));
 verbose = local_get_field(opts, 'verbose', false);
 
 validate_options(tol, maxIter, mixing, verbose);
@@ -48,6 +67,8 @@ end
 
 relresHistory = NaN(maxIter, 1);
 deltaHistory = NaN(maxIter, 1);
+maxDmuHistory = NaN(maxIter, 1);
+stopHistory = NaN(maxIter, 1);
 
 rhsScale = norm(alphaVec .* Evec);
 if rhsScale == 0
@@ -59,6 +80,9 @@ tStart = tic;
 converged = false;
 iter = 0;
 relres = Inf;
+delta = Inf;
+maxDmu = Inf;
+stopValue = Inf;
 
 for k = 1:maxIter
     iter = k;
@@ -68,22 +92,40 @@ for k = 1:maxIter
 
     muNew = (1 - mixing) * muVec + mixing * muFixed;
 
+    % Residual of updated iterate.
     TmuNew = op.apply(muNew);
     resVec = muNew - alphaVec .* (Evec + TmuNew);
 
     relres = norm(resVec) / rhsScale;
     delta = norm(muNew - muVec) / max(norm(muNew), eps);
 
+    dmuVec = muNew - muVec;
+    dmuMat = util.unstack_xyz(dmuVec);
+    maxDmu = max(vecnorm(dmuMat, 2, 2));
+
+    switch stopMetric
+        case 'relres'
+            stopValue = relres;
+        case 'max_dmu'
+            stopValue = maxDmu;
+        otherwise
+            error('thole:solve_scf_jacobi:BadStopMetric', ...
+                'Unsupported stop metric "%s".', stopMetric);
+    end
+
     relresHistory(k) = relres;
     deltaHistory(k) = delta;
+    maxDmuHistory(k) = maxDmu;
+    stopHistory(k) = stopValue;
 
     muVec = muNew;
 
     if verbose
-        fprintf('  Jacobi iter %4d: relres = %.3e, delta = %.3e\n', k, relres, delta);
+        fprintf('  Jacobi iter %4d: relres = %.3e, max_dmu = %.3e, delta = %.3e\n', ...
+            k, relres, maxDmu, delta);
     end
 
-    if relres <= tol
+    if stopValue <= tol
         converged = true;
         break;
     end
@@ -98,15 +140,26 @@ info = struct();
 info.method = 'jacobi';
 info.converged = converged;
 info.iterations = iter;
+
 info.relres = relres;
+info.delta = delta;
+info.max_dmu = maxDmu;
+
+info.stop_metric = stopMetric;
+info.stop_value = stopValue;
+
 info.tol = tol;
 info.max_iter = maxIter;
 info.mixing = mixing;
 info.solve_time = solveTime;
 info.nPolSites = problem.nPolSites;
 info.nActiveVec = nVec;
+
 info.relres_history = relresHistory(1:iter);
 info.delta_history = deltaHistory(1:iter);
+info.max_dmu_history = maxDmuHistory(1:iter);
+info.stop_history = stopHistory(1:iter);
+
 info.operator_kind = op.kind;
 info.operator_backend = op.backend;
 
@@ -216,6 +269,24 @@ end
 
 if ~isfield(op, 'kind')
     op.kind = '<unknown>';
+end
+
+end
+
+function stopMetric = local_normalize_stop_metric(x)
+
+stopMetric = lower(strtrim(char(string(x))));
+
+switch stopMetric
+    case {'relres', 'relative_residual', 'residual'}
+        stopMetric = 'relres';
+
+    case {'max_dmu', 'max_dipole_update', 'dmu', 'max_update'}
+        stopMetric = 'max_dmu';
+
+    otherwise
+        error('thole:solve_scf_jacobi:BadStopMetric', ...
+            'stop_metric must be ''relres'' or ''max_dmu''.');
 end
 
 end

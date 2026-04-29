@@ -5,26 +5,23 @@ function desc = complete_molecule_descriptors_relative_to_reference(sys, refMolI
 % desc = builder.complete_molecule_descriptors_relative_to_reference(sys, refMolID)
 % desc = builder.complete_molecule_descriptors_relative_to_reference(sys, refMolID, ...)
 %
-% Inputs
-%   sys       working system struct from builder.make_crystal_system
-%   refMolID scalar molecule ID
-%
 % Optional name-value inputs
 %   'StackAxis'        'a' | 'b' | 'c' | numeric 1x3 vector, default 'b'
 %   'IncludeReference' logical, default false
 %   'IncludeNormals'   logical, default true
+%   'Cache'            output of builder.build_complete_molecule_descriptor_cache,
+%                      default []
 %   'Verbose'          logical, default false
 %
-% Output
-%   desc struct with fields:
-%       .reference_mol_id
-%       .reference_site_indices
-%       .reference_com
-%       .reference_normal
-%       .stack_axis_hat
-%       .table
+% Output desc fields
+%   .reference_mol_id
+%   .reference_site_indices
+%   .reference_com
+%   .reference_normal
+%   .stack_axis_hat
+%   .table
 %
-% Descriptor table columns:
+% desc.table columns
 %   molecule_id
 %   is_complete
 %   n_sites
@@ -36,21 +33,18 @@ function desc = complete_molecule_descriptors_relative_to_reference(sys, refMolI
 %   distance
 %   normal_x, normal_y, normal_z
 %   normal_angle_deg
-%
-% Notes
-%   - Only complete displayed molecules are included.
-%   - The reference molecule itself is excluded by default.
-%   - Molecular normals are computed via builder.compute_molecule_frame.
 
 p = inputParser;
 addRequired(p, 'sys', @isstruct);
-addRequired(p, 'refMolID', @(x) isnumeric(x) && isscalar(x) && isfinite(x));
+addRequired(p, 'refMolID', @(x) isnumeric(x) && isscalar(x));
 addParameter(p, 'StackAxis', 'b', ...
     @(x) ischar(x) || isstring(x) || (isnumeric(x) && numel(x) == 3));
 addParameter(p, 'IncludeReference', false, ...
     @(x) islogical(x) && isscalar(x));
 addParameter(p, 'IncludeNormals', true, ...
     @(x) islogical(x) && isscalar(x));
+addParameter(p, 'Cache', [], ...
+    @(x) isempty(x) || isstruct(x));
 addParameter(p, 'Verbose', false, ...
     @(x) islogical(x) && isscalar(x));
 parse(p, sys, refMolID, varargin{:});
@@ -58,89 +52,71 @@ parse(p, sys, refMolID, varargin{:});
 opt = p.Results;
 
 validate_sys(sys);
-validate_reference(sys, refMolID);
 
-T = sys.molecule_table;
+if isempty(opt.Cache)
+    cache = builder.build_complete_molecule_descriptor_cache(sys, ...
+        'StackAxis', opt.StackAxis, ...
+        'IncludeNormals', opt.IncludeNormals, ...
+        'Verbose', false);
+else
+    cache = opt.Cache;
+    validate_cache(cache);
 
-refRow = find(T.molecule_id == refMolID, 1, 'first');
-refIdx = builder.site_indices_for_molecule(sys, refMolID);
-refCOM = T.com(refRow, :);
+    if opt.IncludeNormals && ~cache.include_normals
+        error('builder:complete_molecule_descriptors_relative_to_reference:CacheMissingNormals', ...
+            ['IncludeNormals=true was requested, but the supplied descriptor cache ', ...
+             'was built with IncludeNormals=false. Rebuild the cache with normals.']);
+    end
+end
 
-stackAxisHat = resolve_stack_axis(sys, opt.StackAxis);
+refCacheRow = find(cache.molecule_id(:) == refMolID, 1, 'first');
+
+if isempty(refCacheRow)
+    error('builder:complete_molecule_descriptors_relative_to_reference:BadReferenceMolID', ...
+        'Reference molecule ID %d is not present among complete molecules.', refMolID);
+end
+
+refCOM = cache.com(refCacheRow, :);
+stackAxisHat = cache.stack_axis_hat;
 
 if opt.IncludeNormals
-    refFrame = builder.compute_molecule_frame( ...
-        sys.site_pos(refIdx, :), ...
-        'ReferenceAxis', stackAxisHat);
-    refNormal = refFrame.e3;
+    refNormal = cache.normal(refCacheRow, :);
 else
     refNormal = [NaN NaN NaN];
 end
 
 if opt.IncludeReference
-    rows = (1:numel(T.molecule_id)).';
+    rows = (1:numel(cache.molecule_id)).';
 else
-    rows = find(T.molecule_id ~= refMolID);
+    rows = find(cache.molecule_id(:) ~= refMolID);
 end
-
-rows = rows(logical(T.is_complete_in_display(rows)));
 
 nMol = numel(rows);
 
-molecule_id = zeros(nMol, 1);
-is_complete = false(nMol, 1);
-n_sites = zeros(nMol, 1);
+molecule_id = cache.molecule_id(rows);
+is_complete = cache.is_complete(rows);
+n_sites = cache.n_sites(rows);
+com = cache.com(rows, :);
 
-com = zeros(nMol, 3);
-dr = zeros(nMol, 3);
-
-d_par = zeros(nMol, 1);
-d_perp_vec = zeros(nMol, 3);
-d_perp = zeros(nMol, 1);
-distance = zeros(nMol, 1);
+dr = com - refCOM;
+d_par = dr * stackAxisHat(:);
+d_perp_vec = dr - d_par .* stackAxisHat;
+d_perp = vecnorm(d_perp_vec, 2, 2);
+distance = vecnorm(dr, 2, 2);
 
 normal = nan(nMol, 3);
 normal_angle_deg = nan(nMol, 1);
 
-for k = 1:nMol
-    r = rows(k);
-
-    thisMolID = T.molecule_id(r);
-    idx = builder.site_indices_for_molecule(sys, thisMolID);
-
-    thisCOM = T.com(r, :);
-    thisDR = thisCOM - refCOM;
-
-    thisDpar = dot(thisDR, stackAxisHat);
-    thisDperpVec = thisDR - thisDpar * stackAxisHat;
-
-    molecule_id(k) = thisMolID;
-    is_complete(k) = T.is_complete_in_display(r);
-    n_sites(k) = T.n_sites(r);
-
-    com(k, :) = thisCOM;
-    dr(k, :) = thisDR;
-
-    d_par(k) = thisDpar;
-    d_perp_vec(k, :) = thisDperpVec;
-    d_perp(k) = norm(thisDperpVec);
-    distance(k) = norm(thisDR);
-
-    if opt.IncludeNormals
-        thisFrame = builder.compute_molecule_frame( ...
-            sys.site_pos(idx, :), ...
-            'ReferenceAxis', stackAxisHat);
-        thisNormal = thisFrame.e3;
-
-        normal(k, :) = thisNormal;
-        normal_angle_deg(k) = unoriented_angle_deg(refNormal, thisNormal);
-    end
+if opt.IncludeNormals
+    normal = cache.normal(rows, :);
+    normal_angle_deg = local_unoriented_angle_deg_vectorized(refNormal, normal);
 end
 
 [~, order] = sort(distance, 'ascend');
 
-desc = struct();
+refIdx = builder.site_indices_for_molecule(sys, refMolID);
 
+desc = struct();
 desc.reference_mol_id = refMolID;
 desc.reference_site_indices = refIdx;
 desc.reference_com = refCOM;
@@ -174,18 +150,19 @@ desc.table = table( ...
 
 if opt.Verbose
     fprintf('Descriptor summary:\n');
-    fprintf('  reference molecule ID = %d\n', refMolID);
-    fprintf('  complete molecules used = %d\n', nMol);
-    fprintf('  stack axis hat = [%9.4f %9.4f %9.4f]\n', stackAxisHat);
+    fprintf('  reference molecule ID  = %d\n', refMolID);
+    fprintf('  complete molecules used= %d\n', nMol);
+    fprintf('  stack axis hat         = [%9.4f %9.4f %9.4f]\n', stackAxisHat);
+
     if opt.IncludeNormals
-        fprintf('  reference normal = [%9.4f %9.4f %9.4f]\n', refNormal);
+        fprintf('  reference normal       = [%9.4f %9.4f %9.4f]\n', refNormal);
     end
 end
 
 end
 
 % =========================================================================
-% Local validation / helpers
+% Validation / helper functions
 % =========================================================================
 
 function validate_sys(sys)
@@ -198,21 +175,6 @@ end
 if ~isfield(sys, 'site_pos') || isempty(sys.site_pos)
     error('builder:complete_molecule_descriptors_relative_to_reference:MissingSitePos', ...
         'sys.site_pos is required and missing/empty.');
-end
-
-if size(sys.site_pos, 2) ~= 3
-    error('builder:complete_molecule_descriptors_relative_to_reference:BadSitePos', ...
-        'sys.site_pos must be N x 3.');
-end
-
-if ~isfield(sys, 'site_mol_id') || isempty(sys.site_mol_id)
-    error('builder:complete_molecule_descriptors_relative_to_reference:MissingSiteMolID', ...
-        'sys.site_mol_id is required and missing/empty.');
-end
-
-if numel(sys.site_mol_id) ~= size(sys.site_pos, 1)
-    error('builder:complete_molecule_descriptors_relative_to_reference:BadSiteMolID', ...
-        'sys.site_mol_id must have one entry per site.');
 end
 
 if ~isfield(sys, 'molecule_table') || isempty(sys.molecule_table)
@@ -238,89 +200,67 @@ if size(T.com, 2) ~= 3
         'sys.molecule_table.com must be N x 3.');
 end
 
-nMol = numel(T.molecule_id);
-
-if size(T.com, 1) ~= nMol || ...
-        numel(T.n_sites) ~= nMol || ...
-        numel(T.is_complete_in_display) ~= nMol
-    error('builder:complete_molecule_descriptors_relative_to_reference:BadMoleculeTableSize', ...
-        'molecule_table fields must have one row/entry per molecule_id.');
 end
 
-end
+function validate_cache(cache)
 
-function validate_reference(sys, refMolID)
+required = {
+    'molecule_id'
+    'molecule_table_row'
+    'is_complete'
+    'n_sites'
+    'com'
+    'normal'
+    'include_normals'
+    'stack_axis_hat'
+};
 
-allMolIDs = sys.molecule_table.molecule_id(:);
+for k = 1:numel(required)
+    name = required{k};
 
-if ~ismember(refMolID, allMolIDs)
-    error('builder:complete_molecule_descriptors_relative_to_reference:BadReferenceMolID', ...
-        'Reference molecule ID %d is not present in sys.molecule_table.', refMolID);
-end
-
-row = find(allMolIDs == refMolID, 1, 'first');
-
-if ~sys.molecule_table.is_complete_in_display(row)
-    error('builder:complete_molecule_descriptors_relative_to_reference:IncompleteReference', ...
-        'Reference molecule ID %d is not complete in the displayed supercell.', refMolID);
-end
-
-end
-
-function stackAxisHat = resolve_stack_axis(sys, axisSpec)
-
-if ischar(axisSpec) || (isstring(axisSpec) && isscalar(axisSpec))
-    axisSpec = lower(char(string(axisSpec)));
-
-    if ~isfield(sys, 'super_lattice') || isempty(sys.super_lattice)
-        error('builder:complete_molecule_descriptors_relative_to_reference:MissingSuperLattice', ...
-            'sys.super_lattice is required for symbolic stack-axis selection.');
+    if ~isfield(cache, name) || isempty(cache.(name))
+        error('builder:complete_molecule_descriptors_relative_to_reference:BadCache', ...
+            'cache.%s is required and missing/empty.', name);
     end
-
-    switch axisSpec
-        case 'a'
-            v = sys.super_lattice(1, :);
-
-        case 'b'
-            v = sys.super_lattice(2, :);
-
-        case 'c'
-            v = sys.super_lattice(3, :);
-
-        otherwise
-            error('builder:complete_molecule_descriptors_relative_to_reference:BadStackAxis', ...
-                'StackAxis must be ''a'', ''b'', ''c'', or a numeric 1x3 vector.');
-    end
-
-elseif isnumeric(axisSpec) && numel(axisSpec) == 3
-    v = reshape(axisSpec, 1, 3);
-
-else
-    error('builder:complete_molecule_descriptors_relative_to_reference:BadStackAxis', ...
-        'StackAxis must be ''a'', ''b'', ''c'', or a numeric 1x3 vector.');
 end
 
-nv = norm(v);
-
-if nv == 0
-    error('builder:complete_molecule_descriptors_relative_to_reference:ZeroStackAxis', ...
-        'Resolved stack axis has zero norm.');
+if size(cache.com, 2) ~= 3
+    error('builder:complete_molecule_descriptors_relative_to_reference:BadCacheCOM', ...
+        'cache.com must be N x 3.');
 end
 
-stackAxisHat = v / nv;
+if size(cache.normal, 2) ~= 3
+    error('builder:complete_molecule_descriptors_relative_to_reference:BadCacheNormal', ...
+        'cache.normal must be N x 3.');
+end
+
+if numel(cache.stack_axis_hat) ~= 3 || norm(cache.stack_axis_hat) == 0
+    error('builder:complete_molecule_descriptors_relative_to_reference:BadCacheStackAxis', ...
+        'cache.stack_axis_hat must be a nonzero 1x3 vector.');
+end
+
+cache.stack_axis_hat = reshape(cache.stack_axis_hat, 1, 3); %#ok<NASGU>
 
 end
 
-function ang = unoriented_angle_deg(n1, n2)
+function ang = local_unoriented_angle_deg_vectorized(refNormal, normal)
 
-if any(isnan(n1)) || any(isnan(n2))
-    ang = NaN;
+n = size(normal, 1);
+ang = nan(n, 1);
+
+if any(isnan(refNormal))
     return;
 end
 
-c = abs(dot(n1, n2));
+valid = ~any(isnan(normal), 2);
+
+if ~any(valid)
+    return;
+end
+
+c = abs(normal(valid, :) * refNormal(:));
 c = min(max(c, -1), 1);
 
-ang = acosd(c);
+ang(valid) = acosd(c);
 
 end
