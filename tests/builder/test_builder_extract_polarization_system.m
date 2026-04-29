@@ -3,6 +3,11 @@ function test_builder_extract_polarization_system()
 %
 % This tests that charged/active/polarizable fields survive extraction and
 % that periodic/nonperiodic mode flags are set consistently.
+%
+% Important invariant:
+%   Charged molecule sites should be nonpolarizable for induced-dipole SCF,
+%   but their physical site_alpha values should be preserved for Thole
+%   damping/smearing in external-field calculations.
 
 sys = local_make_charged_sys();
 
@@ -19,7 +24,6 @@ assert(polsys.n_sites == nSites, ...
 
 assert(isfield(polsys, 'is_periodic') && polsys.is_periodic, ...
     'Periodic extraction should set polsys.is_periodic = true.');
-
 assert(strcmp(polsys.periodic_mode, 'periodic'), ...
     'Periodic extraction should set periodic_mode = periodic.');
 
@@ -28,28 +32,27 @@ assert(isfield(polsys, 'site_pos') && isequal(size(polsys.site_pos), size(sys.si
 
 assert(isequal(polsys.site_charge(:), sys.site_charge(:)), ...
     'polsys.site_charge should preserve system charges.');
-
 assert(isequal(logical(polsys.site_is_polarizable(:)), logical(sys.site_is_polarizable(:))), ...
     'polsys.site_is_polarizable should preserve polarizable mask.');
-
 assert(isequal(logical(polsys.site_is_active(:)), logical(sys.site_is_active(:))), ...
     'polsys.site_is_active should preserve active mask.');
 
 assert(all(abs(polsys.site_charge(chargedMask)) > 0), ...
     'Charged molecule sites should carry nonzero charge in polsys.');
-
 assert(~any(polsys.site_is_polarizable(chargedMask)), ...
     'Charged molecule sites should remain nonpolarizable in polsys.');
 
-assert(all(polsys.site_alpha(chargedMask) == 0), ...
-    'Charged molecule site alphas should remain zero in polsys.');
+assert(all(polsys.site_alpha(chargedMask) > 0), ...
+    'Charged molecule site_alpha values should be preserved in polsys for Thole damping.');
+
+assert(norm(polsys.site_alpha(chargedMask) - sys.site_alpha(chargedMask), inf) < 1e-14, ...
+    'Charged molecule site_alpha values should be copied unchanged into polsys.');
 
 assert(all(polsys.site_alpha(~chargedMask) > 0), ...
     'Uncharged molecule site alphas should remain positive in polsys.');
 
 assert(isfield(polsys, 'lattice') && isequal(polsys.lattice, sys.super_lattice), ...
     'Periodic polsys.lattice should match sys.super_lattice.');
-
 assert(isfield(polsys, 'super_lattice') && isequal(polsys.super_lattice, sys.super_lattice), ...
     'polsys.super_lattice should match sys.super_lattice.');
 
@@ -66,7 +69,6 @@ polsysNP = builder.extract_polarization_system(sys, struct( ...
 
 assert(~polsysNP.is_periodic, ...
     'Nonperiodic extraction should set polsys.is_periodic = false.');
-
 assert(strcmp(polsysNP.periodic_mode, 'nonperiodic'), ...
     'Nonperiodic extraction should set periodic_mode = nonperiodic.');
 
@@ -79,19 +81,21 @@ activeMask = logical(sys.site_is_active(:));
 
 assert(polsysActive.n_sites == nnz(activeMask), ...
     'active_only extraction should retain only active sites.');
-
 assert(isequal(polsysActive.site_charge(:), sys.site_charge(activeMask)), ...
     'active_only extraction should preserve active-site charges.');
-
 assert(all(abs(polsysActive.site_charge) > 0), ...
     'All active-only extracted sites should be charged in this test.');
 
-io.assert_atomic_units(polsysActive);
+% Active-only charged sites remain nonpolarizable but keep physical alpha.
+assert(~any(polsysActive.site_is_polarizable), ...
+    'Active-only charged extracted sites should remain nonpolarizable.');
+assert(all(polsysActive.site_alpha > 0), ...
+    'Active-only charged extracted sites should preserve physical site_alpha.');
 
+io.assert_atomic_units(polsysActive);
 end
 
 function sys = local_make_charged_sys()
-
 [filename, tmpDir] = local_write_two_propene_poscar();
 cleanup = onCleanup(@() local_cleanup(tmpDir)); %#ok<NASGU>
 
@@ -117,49 +121,42 @@ sys = builder.apply_molecule_charges(sys, molIDs, ...
     'ZeroExistingCharges', true, ...
     'RequireComplete', true, ...
     'Verbose', false);
-
 end
 
 function model = local_make_model()
-
 model = struct();
 model.thole_a = 0.39;
 model.alpha_units = 'angstrom^3';
 
-model.polarizable_classes = {
-    'C_deg3'
-    'C_deg4'
-    'H_on_C_deg3'
-    'H_on_C_deg4'
-};
+model.polarizable_classes = { ...
+    'C_deg3' ...
+    'C_deg4' ...
+    'H_on_C_deg3' ...
+    'H_on_C_deg4'};
 
 model.alpha_by_class = struct();
 model.alpha_by_class.C_deg3 = 1.750;
 model.alpha_by_class.C_deg4 = 1.750;
 model.alpha_by_class.H_on_C_deg3 = 0.696;
 model.alpha_by_class.H_on_C_deg4 = 0.696;
-
 end
 
 function [filename, tmpDir] = local_write_two_propene_poscar()
-
 tmpDir = tempname;
 mkdir(tmpDir);
 
 filename = fullfile(tmpDir, 'POSCAR_two_propene_extract_test');
 
 xyz0 = [
-    5.0000  5.0000  5.0000
-    6.3400  5.0000  5.0000
-    7.0900  6.2990  5.0000
-
-    4.4550  5.9439  5.0000
-    4.4550  4.0561  5.0000
-    6.8850  4.0561  5.0000
-
-    6.3817  7.1275  5.0000
-    7.7166  6.3568  5.8900
-    7.7166  6.3568  4.1100
+    5.0000 5.0000 5.0000
+    6.3400 5.0000 5.0000
+    7.0900 6.2990 5.0000
+    4.4550 5.9439 5.0000
+    4.4550 4.0561 5.0000
+    6.8850 4.0561 5.0000
+    6.3817 7.1275 5.0000
+    7.7166 6.3568 5.8900
+    7.7166 6.3568 4.1100
 ];
 
 xyzA = xyz0;
@@ -195,13 +192,10 @@ for i = 1:size(xyz, 1)
 end
 
 fclose(fid);
-
 end
 
 function local_cleanup(tmpDir)
-
 if exist(tmpDir, 'dir')
     rmdir(tmpDir, 's');
 end
-
 end

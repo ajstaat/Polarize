@@ -7,9 +7,11 @@ function test_builder_apply_file_charges()
 %     maps nonuniform template charges onto a selected complete molecule
 %   - template atom order can differ from target atom order
 %   - template charges are rescaled to requested total molecular charge
-%   - charged molecule is marked active and removed from polarizable mask
+%   - charged molecule is marked active and removed from induced-dipole mask
+%   - charged molecule physical site_alpha is preserved for Thole damping
 
 sys = local_make_charge_test_sys();
+sysBefore = sys;
 
 completeIDs = builder.complete_molecule_ids(sys);
 assert(numel(completeIDs) >= 2, ...
@@ -49,8 +51,7 @@ target = struct();
 target.site_pos = sys.site_pos(targetIdx, :);
 target.site_type = sys.site_type(targetIdx);
 
-distanceTol = 1e-6;  % bohr; translated identical geometries should be exact
-
+distanceTol = 1e-6; % bohr; translated identical geometries should be exact
 referenceAxis = [0 0 1];
 primaryAxis = [1 0 0];
 
@@ -62,10 +63,8 @@ map = builder.match_molecule_atoms_by_frame(template, target, ...
 
 assert(numel(map.template_to_target) == numel(templateIdxCanonical), ...
     'Matcher should return one target index per template atom.');
-
 assert(numel(unique(map.template_to_target)) == numel(templateIdxCanonical), ...
     'Matcher target assignment should be one-to-one.');
-
 assert(map.max_distance < distanceTol, ...
     'Frame-matched translated molecules should match nearly exactly.');
 
@@ -97,7 +96,6 @@ targetIdx = builder.site_indices_for_molecule(sys, targetMolID);
 
 assert(abs(sum(sys.site_charge(targetIdx)) - 1.0) < 1e-12, ...
     'Target molecule total charge should be rescaled to +1.');
-
 assert(all(abs(sys.site_charge(targetIdx) - expectedCanonical(:)) < 1e-12), ...
     'Target molecule site charges should match oriented frame-mapped template charges.');
 
@@ -108,34 +106,32 @@ assert(all(sys.site_charge(unchargedMask) == 0), ...
 
 assert(all(sys.site_is_active(targetIdx)), ...
     'Target molecule sites should be marked active.');
-
 assert(~any(sys.site_is_active(unchargedMask)), ...
     'Non-target molecule sites should not be marked active.');
 
 assert(~any(sys.site_is_polarizable(targetIdx)), ...
-    'Target molecule sites should be removed from polarizable mask.');
+    'Target molecule sites should be removed from induced-dipole polarizable mask.');
 
-assert(all(sys.site_alpha(targetIdx) == 0), ...
-    'Target molecule polarizabilities should be zeroed.');
+assert(all(sys.site_alpha(targetIdx) > 0), ...
+    'Target charged molecule physical site_alpha values should be preserved for Thole damping.');
+
+assert(norm(sys.site_alpha(targetIdx) - sysBefore.site_alpha(targetIdx), inf) < 1e-14, ...
+    'Target charged molecule site_alpha values should be unchanged by charge assignment.');
 
 assert(all(sys.site_is_polarizable(unchargedMask)), ...
     'Non-target molecule sites should remain polarizable.');
-
 assert(all(sys.site_alpha(unchargedMask) > 0), ...
     'Non-target molecule polarizabilities should remain positive.');
 
 assert(isequal(sys.charged_molecules(:), targetMolID), ...
     'charged_molecules bookkeeping should record target molecule.');
-
 assert(isequal(sys.charged_molecule_total_charges(:), 1.0), ...
     'charged_molecule_total_charges should record requested total charge.');
 
 io.assert_atomic_units(sys);
-
 end
 
 function sys = local_make_charge_test_sys()
-
 [filename, tmpDir] = local_write_two_propene_poscar();
 cleanup = onCleanup(@() local_cleanup(tmpDir)); %#ok<NASGU>
 
@@ -149,49 +145,42 @@ sys = builder.make_crystal_system(crystal, model, struct( ...
     'supercell_size', [2 1 1], ...
     'bondScale', 1.20, ...
     'verbose', false));
-
 end
 
 function model = local_make_model()
-
 model = struct();
 model.thole_a = 0.39;
 model.alpha_units = 'angstrom^3';
 
-model.polarizable_classes = {
-    'C_deg3'
-    'C_deg4'
-    'H_on_C_deg3'
-    'H_on_C_deg4'
-};
+model.polarizable_classes = { ...
+    'C_deg3' ...
+    'C_deg4' ...
+    'H_on_C_deg3' ...
+    'H_on_C_deg4'};
 
 model.alpha_by_class = struct();
 model.alpha_by_class.C_deg3 = 1.750;
 model.alpha_by_class.C_deg4 = 1.750;
 model.alpha_by_class.H_on_C_deg3 = 0.696;
 model.alpha_by_class.H_on_C_deg4 = 0.696;
-
 end
 
 function [filename, tmpDir] = local_write_two_propene_poscar()
-
 tmpDir = tempname;
 mkdir(tmpDir);
 
 filename = fullfile(tmpDir, 'POSCAR_two_propene_file_charge_test');
 
 xyz0 = [
-    5.0000  5.0000  5.0000
-    6.3400  5.0000  5.0000
-    7.0900  6.2990  5.0000
-
-    4.4550  5.9439  5.0000
-    4.4550  4.0561  5.0000
-    6.8850  4.0561  5.0000
-
-    6.3817  7.1275  5.0000
-    7.7166  6.3568  5.8900
-    7.7166  6.3568  4.1100
+    5.0000 5.0000 5.0000
+    6.3400 5.0000 5.0000
+    7.0900 6.2990 5.0000
+    4.4550 5.9439 5.0000
+    4.4550 4.0561 5.0000
+    6.8850 4.0561 5.0000
+    6.3817 7.1275 5.0000
+    7.7166 6.3568 5.8900
+    7.7166 6.3568 4.1100
 ];
 
 xyzA = xyz0;
@@ -227,13 +216,10 @@ for i = 1:size(xyz, 1)
 end
 
 fclose(fid);
-
 end
 
 function local_cleanup(tmpDir)
-
 if exist(tmpDir, 'dir')
     rmdir(tmpDir, 's');
 end
-
 end
