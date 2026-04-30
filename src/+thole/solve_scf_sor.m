@@ -6,7 +6,7 @@ function [mu, info] = solve_scf_sor(problem, op, opts)
 %
 % Solves:
 %
-%   mu = A * (Eext + T*mu)
+%   mu = alpha .* (Eext + T*mu)
 %
 % using active-site block Gauss-Seidel / SOR updates:
 %
@@ -20,26 +20,33 @@ function [mu, info] = solve_scf_sor(problem, op, opts)
 %
 % Fast paths:
 %
-% 1. Periodic Ewald row cache:
-%      op.periodic_cache.real_cache
-%      op.periodic_cache.k_cache
-%      op.periodic_cache.self_block
-%      op.periodic_cache.surface_block
+%   1. Periodic P3M row cache:
+%        op.periodic_p3m_cache.real_cache
+%        op.periodic_p3m_cache.p3m_cache
+%        op.periodic_p3m_cache.self_block
+%        op.periodic_p3m_cache.surface_block
 %
-%    This path performs the real-space row contraction directly and keeps
-%    reciprocal-space source sums live during the sweep, updating them
-%    incrementally after each site dipole update.
+%      Real-space is swept row-by-row with Gauss-Seidel/SOR updates.
+%      P3M reciprocal space is evaluated once per sweep and lagged during
+%      that sweep. Surface dipole is updated row-by-row.
 %
-% 2. Nonperiodic raw row cache:
-%      op.row_cache.row_ptr
-%      op.row_cache.col_idx
-%      op.row_cache.dr
-%      op.row_cache.thole_f3
-%      op.row_cache.thole_f5
-%      op.row_cache.inv_r3_bare
-%      op.row_cache.inv_r5_bare
+%   2. Periodic Ewald row cache:
+%        op.periodic_cache.real_cache
+%        op.periodic_cache.k_cache
+%        op.periodic_cache.self_block
+%        op.periodic_cache.surface_block
 %
-%    This avoids one function-handle call per active site per iteration.
+%      Real-space is swept row-by-row and reciprocal Ewald source sums are
+%      updated incrementally during the sweep.
+%
+%   3. Nonperiodic raw row cache:
+%        op.row_cache.row_ptr
+%        op.row_cache.col_idx
+%        op.row_cache.dr
+%        op.row_cache.thole_f3
+%        op.row_cache.thole_f5
+%        op.row_cache.inv_r3_bare
+%        op.row_cache.inv_r5_bare
 
 if nargin < 3 || isempty(opts)
     opts = struct();
@@ -66,7 +73,7 @@ verbose = local_get_field(opts, 'verbose', false);
 validate_options(tol, maxIter, omega, residualEvery, verbose);
 
 nPol = problem.nPolSites;
-nVec = 3*nPol;
+nVec = 3 * nPol;
 
 alphaVec = problem.alpha_pol_vec(:);
 Evec = problem.Eext_pol_vec(:);
@@ -82,6 +89,7 @@ if numel(muVec) ~= nVec
         'Initial active-space dipole vector has wrong size.');
 end
 
+usePeriodicP3MRawFastPath = local_has_periodic_p3m_raw_fast_path(op);
 usePeriodicRawFastPath = local_has_periodic_raw_fast_path(op);
 useRawRowCacheFastPath = local_has_raw_rowcache_fast_path(op);
 
@@ -107,17 +115,26 @@ iter = 0;
 
 for k = 1:maxIter
     iter = k;
+
     muOldVec = muVec;
 
     % ---------------------------------------------------------------------
     % Gauss-Seidel / SOR sweep.
     % ---------------------------------------------------------------------
-    if usePeriodicRawFastPath
+
+    if usePeriodicP3MRawFastPath
+        muVec = local_sor_sweep_periodic_p3m_raw( ...
+            muVec, alphaVec, Evec, omega, ...
+            op.periodic_p3m_cache, problem.activeSites(:), problem.nSites);
+
+    elseif usePeriodicRawFastPath
         muVec = local_sor_sweep_periodic_raw( ...
             muVec, alphaVec, Evec, omega, op.periodic_cache);
+
     elseif useRawRowCacheFastPath
         muVec = local_sor_sweep_rowcache_raw( ...
             muVec, alphaVec, Evec, omega, op.row_cache);
+
     else
         muVec = local_sor_sweep_generic( ...
             muVec, alphaVec, Evec, omega, op, nPol);
@@ -126,14 +143,17 @@ for k = 1:maxIter
     % ---------------------------------------------------------------------
     % Cheap update diagnostics.
     % ---------------------------------------------------------------------
+
     dmuVec = muVec - muOldVec;
     dmuMat = util.unstack_xyz(dmuVec);
+
     maxDmu = max(vecnorm(dmuMat, 2, 2));
     delta = norm(dmuVec) / max(norm(muVec), eps);
 
     % ---------------------------------------------------------------------
     % Expensive residual diagnostic.
     % ---------------------------------------------------------------------
+
     needResidual = false;
 
     if strcmp(stopMetric, 'relres')
@@ -143,12 +163,19 @@ for k = 1:maxIter
     end
 
     if needResidual
-        if usePeriodicRawFastPath
+        if usePeriodicP3MRawFastPath
+            relres = local_relres_periodic_p3m_raw( ...
+                muVec, alphaVec, Evec, op.periodic_p3m_cache, ...
+                problem.activeSites(:), problem.nSites, rhsScale);
+
+        elseif usePeriodicRawFastPath
             relres = local_relres_periodic_raw( ...
                 muVec, alphaVec, Evec, op.periodic_cache, rhsScale);
+
         elseif useRawRowCacheFastPath
             relres = local_relres_rowcache_raw( ...
                 muVec, alphaVec, Evec, op.row_cache, rhsScale);
+
         else
             Tmu = op.apply(muVec);
             resVec = muVec - alphaVec .* (Evec + Tmu);
@@ -194,12 +221,19 @@ end
 % Always compute a final residual for honest reporting and energy sanity.
 tFinalResidual = tic;
 
-if usePeriodicRawFastPath
+if usePeriodicP3MRawFastPath
+    relresFinal = local_relres_periodic_p3m_raw( ...
+        muVec, alphaVec, Evec, op.periodic_p3m_cache, ...
+        problem.activeSites(:), problem.nSites, rhsScale);
+
+elseif usePeriodicRawFastPath
     relresFinal = local_relres_periodic_raw( ...
         muVec, alphaVec, Evec, op.periodic_cache, rhsScale);
+
 elseif useRawRowCacheFastPath
     relresFinal = local_relres_rowcache_raw( ...
         muVec, alphaVec, Evec, op.row_cache, rhsScale);
+
 else
     TmuFinal = op.apply(muVec);
     resVecFinal = muVec - alphaVec .* (Evec + TmuFinal);
@@ -242,16 +276,23 @@ info.final_residual_time = finalResidualTime;
 info.solve_time = solveTime;
 info.nPolSites = nPol;
 info.nActiveVec = nVec;
+
 info.relres_history = relresHistory(1:iter);
 info.delta_history = deltaHistory(1:iter);
 info.max_dmu_history = maxDmuHistory(1:iter);
 info.stop_history = stopHistory(1:iter);
 info.residual_computed_history = residualComputedHistory(1:iter);
+
 info.operator_kind = op.kind;
 info.operator_backend = op.backend;
-info.used_periodic_fast_path = usePeriodicRawFastPath;
-info.used_rowcache_fast_path = useRawRowCacheFastPath || usePeriodicRawFastPath;
-info.rowcache_fast_path_type = local_fast_path_name(usePeriodicRawFastPath, useRawRowCacheFastPath);
+
+info.used_periodic_p3m_fast_path = usePeriodicP3MRawFastPath;
+info.used_periodic_fast_path = usePeriodicRawFastPath || usePeriodicP3MRawFastPath;
+info.used_rowcache_fast_path = useRawRowCacheFastPath || ...
+    usePeriodicRawFastPath || usePeriodicP3MRawFastPath;
+
+info.rowcache_fast_path_type = local_fast_path_name( ...
+    usePeriodicP3MRawFastPath, usePeriodicRawFastPath, useRawRowCacheFastPath);
 end
 
 % =========================================================================
@@ -263,10 +304,129 @@ for a = 1:nPol
     block = local_block_indices(a);
 
     TiMu = op.apply_row(a, muVec);
-    muFixed = alphaVec(block) .* (Evec(block) + TiMu);
 
+    muFixed = alphaVec(block) .* (Evec(block) + TiMu);
     muVec(block) = (1 - omega) .* muVec(block) + omega .* muFixed;
 end
+end
+
+function muVec = local_sor_sweep_periodic_p3m_raw( ...
+    muVec, alphaVec, Evec, omega, periodicP3MCache, activeSites, nSites)
+%LOCAL_SOR_SWEEP_PERIODIC_P3M_RAW Split SOR sweep for periodic P3M.
+%
+% Real-space is true row-wise Gauss-Seidel/SOR using the periodic row cache.
+% Reciprocal P3M is evaluated once at the start of the sweep and lagged
+% during that sweep.
+%
+% Self and surface terms are handled implicitly at the row level:
+%
+%   (I - alpha_i * Tii_local) mu_i =
+%       alpha_i * (Eext_i + Ereal_i + Erecip_lag_i + Esurf_without_i)
+%
+% where:
+%
+%   Tii_local = selfBlock + surfaceBlock
+%
+% for vacuum/surface boundary. For tinfoil, surfaceBlock is zero.
+
+realCache = periodicP3MCache.real_cache;
+p3mCache = periodicP3MCache.p3m_cache;
+
+rowPtr = realCache.row_ptr(:);
+colIdx = realCache.col_idx(:);
+drAll = realCache.dr;
+coeffIsoAll = realCache.coeff_iso(:);
+coeffDyadAll = realCache.coeff_dyad(:);
+
+nPol = numel(rowPtr) - 1;
+
+muPol = util.unstack_xyz(muVec);
+EextPol = util.unstack_xyz(Evec);
+alphaPol = alphaVec(1:3:end);
+
+selfBlock = local_get_cache_block(periodicP3MCache, 'self_block');
+surfaceBlock = local_get_cache_block(periodicP3MCache, 'surface_block');
+
+hasSelf = ~isempty(selfBlock) && any(selfBlock(:) ~= 0);
+hasSurface = ~isempty(surfaceBlock) && any(surfaceBlock(:) ~= 0);
+
+% Lagged reciprocal P3M field for this sweep.
+muFull = zeros(nSites, 3);
+muFull(activeSites, :) = muPol;
+
+[ErecipFull, ~] = p3m.apply_dipole_cache(p3mCache, muFull);
+ErecipPol = ErecipFull(activeSites, :);
+
+% Current total cell dipole for surface term bookkeeping.
+M = sum(muPol, 1);
+
+oneMinusOmega = 1 - omega;
+I3 = eye(3);
+
+for i = 1:nPol
+    k0 = rowPtr(i);
+    k1 = rowPtr(i + 1) - 1;
+
+    muBefore = muPol(i, :);
+
+    ELoc = EextPol(i, :) + ErecipPol(i, :);
+
+    % Real-space row contribution uses current partially-updated muPol.
+    if k1 >= k0
+        idx = k0:k1;
+        cols = colIdx(idx);
+
+        muNbr = muPol(cols, :);
+        dr = drAll(idx, :);
+
+        muDotR = sum(muNbr .* dr, 2);
+
+        contrib = coeffIsoAll(idx) .* muNbr + ...
+            coeffDyadAll(idx) .* muDotR .* dr;
+
+        ELoc = ELoc + sum(contrib, 1);
+    end
+
+    % Surface term:
+    %   Esurf_i = surfaceBlock * M
+    % but M includes mu_i. For an implicit local update, split
+    %
+    %   M = M_without_i + mu_i
+    %
+    % and put surfaceBlock*mu_i on the local left-hand side.
+    localBlock = zeros(3, 3);
+
+    if hasSelf
+        localBlock = localBlock + selfBlock;
+    end
+
+    if hasSurface
+        Mwithout = M - muBefore;
+        ELoc = ELoc + (surfaceBlock * Mwithout.').';
+        localBlock = localBlock + surfaceBlock;
+    end
+
+    alpha_i = alphaPol(i);
+
+    if any(localBlock(:) ~= 0)
+        Aii = I3 - alpha_i .* localBlock;
+        rhs = alpha_i .* ELoc(:);
+        muGS = (Aii \ rhs).';
+    else
+        muGS = alpha_i .* ELoc;
+    end
+
+    muNew = oneMinusOmega .* muBefore + omega .* muGS;
+
+    deltaMu = muNew - muBefore;
+
+    if any(deltaMu ~= 0)
+        muPol(i, :) = muNew;
+        M = M + deltaMu;
+    end
+end
+
+muVec = util.stack_xyz(muPol);
 end
 
 function muVec = local_sor_sweep_periodic_raw(muVec, alphaVec, Evec, omega, periodicCache)
@@ -283,6 +443,7 @@ nPol = numel(rowPtr) - 1;
 
 muPol = util.unstack_xyz(muVec);
 muOldPol = muPol;
+
 EextPol = util.unstack_xyz(Evec);
 alphaPol = alphaVec(1:3:end);
 
@@ -312,7 +473,7 @@ for i = 1:nPol
         muDotR = sum(muNbr .* dr, 2);
 
         contrib = coeffIsoAll(idx) .* muNbr + ...
-                  coeffDyadAll(idx) .* muDotR .* dr;
+            coeffDyadAll(idx) .* muDotR .* dr;
 
         ELoc = ELoc + sum(contrib, 1);
     end
@@ -352,6 +513,7 @@ function muVec = local_sor_sweep_rowcache_raw(muVec, alphaVec, Evec, omega, rowC
 rowPtr = rowCache.row_ptr(:);
 colIdx = rowCache.col_idx(:);
 drAll = rowCache.dr;
+
 f3All = rowCache.thole_f3(:);
 f5All = rowCache.thole_f5(:);
 invR3All = rowCache.inv_r3_bare(:);
@@ -361,6 +523,7 @@ nPol = numel(rowPtr) - 1;
 
 muPol = util.unstack_xyz(muVec);
 muOldPol = muPol;
+
 EextPol = util.unstack_xyz(Evec);
 alphaPol = alphaVec(1:3:end);
 
@@ -405,6 +568,49 @@ end
 % Residual implementations
 % =========================================================================
 
+function relres = local_relres_periodic_p3m_raw( ...
+    muVec, alphaVec, Evec, periodicP3MCache, activeSites, nSites, rhsScale)
+%LOCAL_RELRES_PERIODIC_P3M_RAW Full residual for periodic P3M row-cache path.
+
+realCache = periodicP3MCache.real_cache;
+p3mCache = periodicP3MCache.p3m_cache;
+
+muPol = util.unstack_xyz(muVec);
+EextPol = util.unstack_xyz(Evec);
+alphaPol = alphaVec(1:3:end);
+
+% Real-space contribution.
+EdipPol = thole.apply_periodic_real_cache(realCache, muPol);
+
+% Reciprocal P3M contribution.
+muFull = zeros(nSites, 3);
+muFull(activeSites, :) = muPol;
+
+[ErecipFull, ~] = p3m.apply_dipole_cache(p3mCache, muFull);
+EdipPol = EdipPol + ErecipFull(activeSites, :);
+
+% Self.
+selfBlock = local_get_cache_block(periodicP3MCache, 'self_block');
+
+if ~isempty(selfBlock)
+    EdipPol = EdipPol + muPol * selfBlock.';
+end
+
+% Surface.
+surfaceBlock = local_get_cache_block(periodicP3MCache, 'surface_block');
+
+if ~isempty(surfaceBlock) && any(surfaceBlock(:) ~= 0)
+    M = sum(muPol, 1);
+    Esurf = (surfaceBlock * M.').';
+    EdipPol = EdipPol + repmat(Esurf, size(muPol, 1), 1);
+end
+
+rhsPol = alphaPol .* (EextPol + EdipPol);
+rPol = muPol - rhsPol;
+
+relres = norm(rPol, 'fro') / rhsScale;
+end
+
 function relres = local_relres_periodic_raw(muVec, alphaVec, Evec, periodicCache, rhsScale)
 realCache = periodicCache.real_cache;
 kCache = periodicCache.k_cache;
@@ -441,7 +647,7 @@ for i = 1:nPol
     muDotR = sum(muNbr .* dr, 2);
 
     contrib = coeffIsoAll(idx) .* muNbr + ...
-              coeffDyadAll(idx) .* muDotR .* dr;
+        coeffDyadAll(idx) .* muDotR .* dr;
 
     EdipPol(i, :) = sum(contrib, 1);
 end
@@ -451,12 +657,14 @@ EdipPol = EdipPol + local_apply_periodic_kspace_all(muPol, kCache);
 
 % Self.
 selfBlock = local_get_cache_block(periodicCache, 'self_block');
+
 if ~isempty(selfBlock)
     EdipPol = EdipPol + muPol * selfBlock.';
 end
 
 % Surface.
 surfaceBlock = local_get_cache_block(periodicCache, 'surface_block');
+
 if ~isempty(surfaceBlock) && any(surfaceBlock(:) ~= 0)
     M = sum(muPol, 1);
     Esurf = (surfaceBlock * M.').';
@@ -473,6 +681,7 @@ function relres = local_relres_rowcache_raw(muVec, alphaVec, Evec, rowCache, rhs
 rowPtr = rowCache.row_ptr(:);
 colIdx = rowCache.col_idx(:);
 drAll = rowCache.dr;
+
 f3All = rowCache.thole_f3(:);
 f5All = rowCache.thole_f5(:);
 invR3All = rowCache.inv_r3_bare(:);
@@ -537,6 +746,7 @@ if ~isfield(kCache, 'num_kvec') || kCache.num_kvec == 0
 end
 
 storageMode = 'full';
+
 if isfield(kCache, 'storage_mode') && ~isempty(kCache.storage_mode)
     storageMode = lower(char(string(kCache.storage_mode)));
 end
@@ -546,7 +756,6 @@ switch storageMode
         kState.mode = 'full';
 
         kvecsT = kCache.kvecs_T;
-
         [cosPhase, sinPhase] = local_get_full_phase(kCache);
 
         v = muPol * kvecsT;
@@ -570,6 +779,7 @@ switch storageMode
             end
 
             [cosPhase, sinPhase] = local_get_block_phase(kCache, blk);
+
             v = muPol * blk.kvecs_T;
 
             kState.blocks(b).A = sum(cosPhase .* v, 1);
@@ -590,7 +800,6 @@ end
 switch kState.mode
     case 'full'
         kvecsT = kCache.kvecs_T;
-
         [cosPhase, sinPhase] = local_get_full_phase(kCache);
 
         dv = deltaMu * kvecsT;
@@ -607,6 +816,7 @@ switch kState.mode
             end
 
             [cosPhase, sinPhase] = local_get_block_phase(kCache, blk);
+
             dv = deltaMu * blk.kvecs_T;
 
             kState.blocks(b).A = kState.blocks(b).A + cosPhase(i, :) .* dv;
@@ -631,7 +841,7 @@ switch kState.mode
         [cosPhase, sinPhase] = local_get_full_phase(kCache);
 
         phaseFactor = cosPhase(i, :) .* kState.A + ...
-                      sinPhase(i, :) .* kState.B;
+            sinPhase(i, :) .* kState.B;
 
         W = phaseFactor .* kCache.two_pref(:).';
         Ei = W * kCache.kvecs;
@@ -647,7 +857,7 @@ switch kState.mode
             [cosPhase, sinPhase] = local_get_block_phase(kCache, blk);
 
             phaseFactor = cosPhase(i, :) .* kState.blocks(b).A + ...
-                          sinPhase(i, :) .* kState.blocks(b).B;
+                sinPhase(i, :) .* kState.blocks(b).B;
 
             W = phaseFactor .* blk.two_pref(:).';
             Ei = Ei + W * blk.kvecs;
@@ -668,6 +878,7 @@ if ~isfield(kCache, 'num_kvec') || kCache.num_kvec == 0
 end
 
 storageMode = 'full';
+
 if isfield(kCache, 'storage_mode') && ~isempty(kCache.storage_mode)
     storageMode = lower(char(string(kCache.storage_mode)));
 end
@@ -720,8 +931,10 @@ end
 function [cosPhase, sinPhase] = local_get_full_phase(kCache)
 if isfield(kCache, 'cos_phase') && ~isempty(kCache.cos_phase) && ...
         isfield(kCache, 'sin_phase') && ~isempty(kCache.sin_phase)
+
     cosPhase = kCache.cos_phase;
     sinPhase = kCache.sin_phase;
+
 else
     phase = kCache.active_pos * kCache.kvecs_T;
     cosPhase = cos(phase);
@@ -733,8 +946,10 @@ function [cosPhase, sinPhase] = local_get_block_phase(kCache, blk)
 if isfield(blk, 'cos_phase') && ~isempty(blk.cos_phase) && ...
         isfield(blk, 'sin_phase') && ~isempty(blk.sin_phase) && ...
         size(blk.cos_phase, 2) == blk.nk
+
     cosPhase = blk.cos_phase;
     sinPhase = blk.sin_phase;
+
 else
     phase = kCache.active_pos * blk.kvecs_T;
     cosPhase = cos(phase);
@@ -766,7 +981,7 @@ required = {
     'nSites'
     'Eext_pol_vec'
     'alpha_pol_vec'
-};
+    };
 
 for k = 1:numel(required)
     name = required{k};
@@ -779,7 +994,9 @@ end
 
 nVec = 3 * problem.nPolSites;
 
-if numel(problem.Eext_pol_vec) ~= nVec || numel(problem.alpha_pol_vec) ~= nVec
+if numel(problem.Eext_pol_vec) ~= nVec || ...
+        numel(problem.alpha_pol_vec) ~= nVec
+
     error('thole:solve_scf_sor:BadProblemSize', ...
         'Active-space vectors must have length 3*problem.nPolSites.');
 end
@@ -798,6 +1015,7 @@ end
 
 if ~isfield(op, 'kind') || ~strcmp(op.kind, 'matrix_free')
     kind = '';
+
     if isfield(op, 'kind')
         kind = char(string(op.kind));
     end
@@ -807,8 +1025,10 @@ if ~isfield(op, 'kind') || ~strcmp(op.kind, 'matrix_free')
          'Requested op.kind="%s".'], kind);
 end
 
-if ~isfield(op, 'capabilities') || ~isfield(op.capabilities, 'row_update') || ...
+if ~isfield(op, 'capabilities') || ...
+        ~isfield(op.capabilities, 'row_update') || ...
         ~op.capabilities.row_update
+
     error('thole:solve_scf_sor:RequiresRowUpdateCapability', ...
         ['SOR requires op.capabilities.row_update = true. ', ...
          'Construct the operator with Solver="sor", Backend="auto" or "matrix_free".']);
@@ -871,6 +1091,39 @@ switch stopMetric
         error('thole:solve_scf_sor:BadStopMetric', ...
             'stop_metric must be ''relres'' or ''max_dmu''.');
 end
+end
+
+function tf = local_has_periodic_p3m_raw_fast_path(op)
+tf = isfield(op, 'periodic_p3m_cache') && ...
+    isfield(op.periodic_p3m_cache, 'real_cache') && ...
+    isfield(op.periodic_p3m_cache, 'p3m_cache') && ...
+    isfield(op.periodic_p3m_cache.real_cache, 'row_ptr') && ...
+    isfield(op.periodic_p3m_cache.real_cache, 'col_idx') && ...
+    isfield(op.periodic_p3m_cache.real_cache, 'dr') && ...
+    isfield(op.periodic_p3m_cache.real_cache, 'coeff_iso') && ...
+    isfield(op.periodic_p3m_cache.real_cache, 'coeff_dyad');
+
+if ~tf
+    return;
+end
+
+rc = op.periodic_p3m_cache.real_cache;
+
+rowPtr = rc.row_ptr(:);
+colIdx = rc.col_idx(:);
+
+if isempty(rowPtr)
+    tf = false;
+    return;
+end
+
+nEntries = rowPtr(end) - 1;
+
+tf = numel(colIdx) == nEntries && ...
+    size(rc.dr, 1) == nEntries && ...
+    size(rc.dr, 2) == 3 && ...
+    numel(rc.coeff_iso) == nEntries && ...
+    numel(rc.coeff_dyad) == nEntries;
 end
 
 function tf = local_has_periodic_raw_fast_path(op)
@@ -950,8 +1203,12 @@ end
 tf = (iter == 1) || (mod(iter, residualEvery) == 0);
 end
 
-function name = local_fast_path_name(usePeriodicRawFastPath, useRawRowCacheFastPath)
-if usePeriodicRawFastPath
+function name = local_fast_path_name( ...
+    usePeriodicP3MRawFastPath, usePeriodicRawFastPath, useRawRowCacheFastPath)
+
+if usePeriodicP3MRawFastPath
+    name = 'periodic_p3m_lagged_recip_rowcache';
+elseif usePeriodicRawFastPath
     name = 'periodic_raw_rowcache';
 elseif useRawRowCacheFastPath
     name = 'raw_rowcache';

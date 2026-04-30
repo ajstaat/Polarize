@@ -42,7 +42,7 @@ cfg = struct();
 cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
 cfg.filename = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
 
-cfg.supercellSize = [6 16 4];
+cfg.supercellSize = [3 11 3];
 cfg.bondScale = 1.20;
 
 cfg.relation = 'same_stack';
@@ -107,7 +107,7 @@ cfg.operator.mode = 'nonperiodic';
 cfg.operator.backend = 'auto';
 cfg.operator.use_thole = true;
 cfg.operator.softening = 0.0;
-cfg.operator.rcut = 18.0;      % finite rcut required for matrix_free nonperiodic
+cfg.operator.rcut = 15.0;      % finite rcut required for matrix_free nonperiodic
 cfg.operator.use_mex = true;
 cfg.operator.profile = false;
 cfg.operator.verbose = true;
@@ -128,7 +128,7 @@ cfg.plot.showDipoles = true;
 cfg.plot.onlyPolarizableDipoles = true;
 cfg.plot.maxArrows = 300;
 cfg.plot.dipoleThreshold = 0.0;
-cfg.plot.arrowScale = 120.0;   % visual scale only
+cfg.plot.arrowScale = 240.0;   % visual scale only
 cfg.plot.arrowLineWidth = 1.0;
 
 HARTREE_TO_EV = 27.211386245988;

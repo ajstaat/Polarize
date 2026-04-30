@@ -1,23 +1,17 @@
-%% run_vasp_periodic_polarization_workflow
+%% run_vasp_periodic_p3m_vs_ewald_timing
 %
-% Real VASP periodic polarization workflow.
-%
-% Default path:
+% Real VASP [2 5 1] periodic timing workflow:
 %
 %   VASP/CONTCAR
 %   -> crystal template
-%   -> periodic [3 5 3] supercell system
+%   -> periodic supercell system
 %   -> centered charged molecular pair
 %   -> periodic polarization system
-%   -> P3M periodic external field
-%   -> periodic_p3m matrix-free rowcache operator
-%   -> SOR solve with lagged P3M reciprocal field
-%   -> active-space polarization energy
+%   -> Ewald external field + periodic_ewald GMRES solve
+%   -> P3M external field   + periodic_p3m GMRES solve
+%   -> timing / apply / energy comparison
 %
-% Optional reference:
-%
-%   Set cfg.compare_to_ewald = true to also run the corresponding periodic
-%   Ewald field/operator/solve/energy and print differences.
+% This is deliberately modeled after run_vasp_periodic_polarization_workflow.
 %
 % Periodic convention:
 %
@@ -25,12 +19,12 @@
 %
 %       cart = frac * H
 %
-% Public workflow code should not manually transpose lattice matrices.
+% Public workflow code should not manually transpose the lattice.
 
 clear; clc; close all;
 
 fprintf('\n============================================================\n');
-fprintf('Real VASP periodic polarization workflow\n');
+fprintf('Real VASP periodic P3M vs Ewald timing workflow\n');
 fprintf('============================================================\n');
 
 HARTREE_TO_EV = 27.211386245988;
@@ -44,7 +38,7 @@ cfg = struct();
 cfg.rootFolder = fullfile(getenv('HOME'), 'Desktop', 'Strain Spectra', 'structures');
 cfg.filename = fullfile(cfg.rootFolder, 'a_0.0_CONTCAR.vasp');
 
-cfg.supercellSize = [3 11 3];
+cfg.supercellSize = [2 5 1];
 cfg.bondScale = 1.20;
 
 cfg.relation = 'same_stack';
@@ -56,39 +50,25 @@ cfg.pairCharges = [+1 -1];
 
 cfg.verbose = true;
 
-% Primary method:
-%
-%   'p3m'   : P3M external field + periodic_p3m operator
-%   'ewald' : Ewald external field + periodic_ewald operator
-%
-cfg.periodic_method = 'p3m';
-
-% Optional Ewald reference. Default false for production workflow.
-cfg.compare_to_ewald = false;
-
 % -------------------------------------------------------------------------
-% Periodic Ewald/P3M shared electrostatic settings.
-% -------------------------------------------------------------------------
-
-cfg.ewald = struct();
-cfg.ewald.alpha = 0.30;
-cfg.ewald.rcut = 18.0;
-cfg.ewald.kcut = 2.50;
-cfg.ewald.boundary = 'tinfoil';
-
-% Ewald reciprocal-cache options, used only for method='ewald' or reference.
-cfg.ewald.kspace_mode = 'auto';
-cfg.ewald.k_block_size = 2048;
-cfg.ewald.kspace_memory_limit_gb = 8;
-
-% -------------------------------------------------------------------------
-% External fixed-charge field controls.
+% Periodic external fixed-charge field: Ewald reference.
 % -------------------------------------------------------------------------
 
 cfg.field = struct();
+cfg.field.mode = 'periodic';
 cfg.field.exclude_self = true;
 cfg.field.use_thole_damping = true;
+cfg.field.kspace_mode = 'auto';      % 'auto' | 'full' | 'blocked'
+cfg.field.k_block_size = 2048;
+cfg.field.kspace_memory_limit_gb = 8;
+cfg.field.real_only = false;
 cfg.field.verbose = false;
+
+cfg.field.ewald = struct();
+cfg.field.ewald.alpha = 0.30;
+cfg.field.ewald.rcut = 18.0;
+cfg.field.ewald.kcut = 2.5;
+cfg.field.ewald.boundary = 'tinfoil';
 
 % -------------------------------------------------------------------------
 % P3M controls.
@@ -96,9 +76,8 @@ cfg.field.verbose = false;
 
 cfg.p3m = struct();
 
-% Convergence-quality default for [3 5 3]. Use [48 72 48] for faster
-% exploratory runs; avoid [32 48 32] for [3 5 3].
-cfg.p3m.mesh_size = [64 96 64];
+% First-pass mesh. Tune this after seeing timing/error.
+cfg.p3m.mesh_size = [32 48 32];
 cfg.p3m.assignment_order = 4;
 
 cfg.p3m.derivative_mode = 'spectral';
@@ -114,21 +93,20 @@ cfg.p3m.alias_range = 2;
 % -------------------------------------------------------------------------
 
 cfg.scf = struct();
-cfg.scf.tol = 1e-6;
-cfg.scf.maxIter = 50;
+cfg.scf.tol = 1e-8;
+cfg.scf.maxIter = 500;
 cfg.scf.mixing = 0.6;
 cfg.scf.omega = 1.0;
 cfg.scf.verbose = false;
 
-% P3M production default is now SOR using the periodic_p3m rowcache path.
+% This timing workflow compares GMRES/global apply, because that is the
+% validated P3M path. SOR/P3M fast path can be tested separately later.
 cfg.solver = struct();
 cfg.solver.method = 'gmres';
 cfg.solver.gmres_restart = [];
 cfg.solver.compute_residual = true;
-
 cfg.solver.jacobi_mixing = 0.6;
-
-cfg.solver.sor_omega = 0.52;
+cfg.solver.sor_omega = 0.97;
 cfg.solver.stop_metric = 'max_dmu';
 cfg.solver.sor_residual_every = 25;
 
@@ -142,25 +120,27 @@ cfg.operator.backend = 'auto';
 cfg.operator.use_thole = true;
 cfg.operator.softening = 0.0;
 
+cfg.operator.alpha = cfg.field.ewald.alpha;
+cfg.operator.rcut = cfg.field.ewald.rcut;
+cfg.operator.kcut = cfg.field.ewald.kcut;
+cfg.operator.boundary = cfg.field.ewald.boundary;
+
+cfg.operator.kspace_mode = cfg.field.kspace_mode;
+cfg.operator.k_block_size = cfg.field.k_block_size;
+cfg.operator.kspace_memory_limit_gb = cfg.field.kspace_memory_limit_gb;
+
 cfg.operator.use_mex = true;
 cfg.operator.use_mex_kspace = true;
 cfg.operator.profile = false;
-cfg.operator.verbose = false;
+cfg.operator.verbose = true;
 
 % Operator-apply timing.
 cfg.timing = struct();
-cfg.timing.apply_repeats = 1;
+cfg.timing.apply_repeats = 5;
 
 %% ------------------------------------------------------------------------
 % Check file and print controls
 % -------------------------------------------------------------------------
-
-cfg.periodic_method = lower(char(string(cfg.periodic_method)));
-
-if ~ismember(cfg.periodic_method, {'p3m','ewald'})
-    error('Unsupported cfg.periodic_method "%s". Use "p3m" or "ewald".', ...
-        cfg.periodic_method);
-end
 
 if ~isfile(cfg.filename)
     error('VASP file not found:\n  %s\nEdit cfg.filename at the top of this script.', cfg.filename);
@@ -169,26 +149,21 @@ end
 fprintf('\nInput structure:\n  %s\n', cfg.filename);
 
 fprintf('\nRun controls:\n');
-fprintf('  periodic method        = %s\n', cfg.periodic_method);
-fprintf('  compare_to_ewald       = %d\n', cfg.compare_to_ewald);
 fprintf('  supercell              = [%d %d %d]\n', cfg.supercellSize);
 fprintf('  relation/shell         = %s / %d\n', cfg.relation, cfg.shell);
 fprintf('  stackAxis/direction    = %s / %s\n', cfg.stackAxis, cfg.direction);
 fprintf('  charges                = [%+.3f %+.3f]\n', cfg.pairCharges);
 fprintf('  solver method          = %s\n', cfg.solver.method);
-fprintf('  alpha                  = %.6g\n', cfg.ewald.alpha);
-fprintf('  rcut                   = %.6g bohr\n', cfg.ewald.rcut);
-fprintf('  kcut                   = %.6g bohr^-1\n', cfg.ewald.kcut);
-fprintf('  boundary               = %s\n', cfg.ewald.boundary);
-fprintf('  Ewald kspace mode      = %s\n', cfg.ewald.kspace_mode);
+fprintf('  Ewald alpha            = %.6g\n', cfg.operator.alpha);
+fprintf('  Ewald rcut             = %.6g bohr\n', cfg.operator.rcut);
+fprintf('  Ewald kcut             = %.6g bohr^-1\n', cfg.operator.kcut);
+fprintf('  Ewald boundary         = %s\n', cfg.operator.boundary);
+fprintf('  Ewald kspace mode      = %s\n', cfg.operator.kspace_mode);
 fprintf('  P3M mesh               = [%d %d %d]\n', cfg.p3m.mesh_size);
 fprintf('  P3M assignment order   = %d\n', cfg.p3m.assignment_order);
 fprintf('  field Thole damping    = %d\n', cfg.field.use_thole_damping);
 fprintf('  operator Thole damping = %d\n', cfg.operator.use_thole);
 fprintf('  operator use_mex       = %d\n', cfg.operator.use_mex);
-fprintf('  SOR omega              = %.6g\n', cfg.solver.sor_omega);
-fprintf('  stop metric            = %s\n', cfg.solver.stop_metric);
-fprintf('  tolerance              = %.3e\n', cfg.scf.tol);
 
 %% ------------------------------------------------------------------------
 % 1. Import crystal template
@@ -197,11 +172,9 @@ fprintf('  tolerance              = %.3e\n', cfg.scf.tol);
 fprintf('\n[1] Importing crystal template...\n');
 
 tImport = tic;
-
 crystal = io.import_contcar_as_crystal(cfg.filename, ...
     'BondScale', cfg.bondScale, ...
     'SortMolecules', false);
-
 importTime = toc(tImport);
 
 fprintf('  import time = %.6f s\n', importTime);
@@ -275,12 +248,12 @@ fprintf('  ||H*G - 2piI||   = %.3e\n', norm(lat0.H * lat0.G - 2*pi*eye(3), 'fro'
 fprintf('  Lmin             = %.8f bohr\n', Lmin0);
 fprintf('  Lmin/2           = %.8f bohr\n', 0.5 * Lmin0);
 
-if ~(cfg.ewald.rcut < 0.5 * Lmin0)
-    error(['Periodic real-space cache requires rcut < Lmin/2.\n' ...
+if ~(cfg.field.ewald.rcut < 0.5 * Lmin0)
+    error(['Periodic Ewald real-space cache requires rcut < Lmin/2.\n' ...
            '  rcut   = %.8f bohr\n' ...
            '  Lmin/2 = %.8f bohr\n' ...
-           'Increase the supercell or reduce cfg.ewald.rcut.'], ...
-           cfg.ewald.rcut, 0.5 * Lmin0);
+           'Increase the supercell or reduce cfg.field.ewald.rcut.'], ...
+           cfg.field.ewald.rcut, 0.5 * Lmin0);
 end
 
 %% ------------------------------------------------------------------------
@@ -290,14 +263,12 @@ end
 fprintf('\n[4] Selecting centered %s shell %d pair...\n', cfg.relation, cfg.shell);
 
 tSelect = tic;
-
 selection = builder.select_centered_neighbor_pair(sys0, ...
     'Relation', cfg.relation, ...
     'Shell', cfg.shell, ...
     'StackAxis', cfg.stackAxis, ...
     'Direction', cfg.direction, ...
     'Verbose', cfg.verbose);
-
 selectTime = toc(tSelect);
 
 pairVector0 = selection.neighbor_com - selection.reference_com;
@@ -388,11 +359,11 @@ fprintf('  ||H*G - 2piI||     = %.3e\n', norm(lat.H * lat.G - 2*pi*eye(3), 'fro'
 fprintf('  Lmin               = %.8f bohr\n', Lmin);
 fprintf('  Lmin/2             = %.8f bohr\n', 0.5 * Lmin);
 
-if ~(cfg.ewald.rcut < 0.5 * Lmin)
+if ~(cfg.field.ewald.rcut < 0.5 * Lmin)
     error(['Periodic real-space cache requires rcut < Lmin/2 after extraction.\n' ...
            '  rcut   = %.8f bohr\n' ...
            '  Lmin/2 = %.8f bohr'], ...
-           cfg.ewald.rcut, 0.5 * Lmin);
+           cfg.field.ewald.rcut, 0.5 * Lmin);
 end
 
 targetMask = logical(polsys.site_is_polarizable(:));
@@ -403,232 +374,309 @@ if abs(sum(polsys.site_charge(sourceMask))) > 1e-10
 end
 
 %% ------------------------------------------------------------------------
-% 7. Primary external field
+% 7. Ewald external field
 % -------------------------------------------------------------------------
 
-fprintf('\n[7] Computing primary periodic external field (%s)...\n', cfg.periodic_method);
+fprintf('\n[7] Computing periodic Ewald external field...\n');
 
-tFieldPrimary = tic;
-[EextPrimary, fieldPartsPrimary] = local_compute_external_field_by_method( ...
-    polsys, targetMask, sourceMask, cfg, 'nonperiodic'); % cfg.periodic_method); 
-fieldTimePrimary = toc(tFieldPrimary);
+fieldParamsEwald = struct();
+fieldParamsEwald.use_thole = cfg.field.use_thole_damping;
+fieldParamsEwald.field = struct();
+fieldParamsEwald.field.mode = cfg.field.mode;
+fieldParamsEwald.field.exclude_self = cfg.field.exclude_self;
+fieldParamsEwald.field.use_thole_damping = cfg.field.use_thole_damping;
+fieldParamsEwald.field.target_mask = targetMask;
+fieldParamsEwald.field.source_mask = sourceMask;
+fieldParamsEwald.field.real_only = cfg.field.real_only;
+fieldParamsEwald.field.kspace_mode = cfg.field.kspace_mode;
+fieldParamsEwald.field.k_block_size = cfg.field.k_block_size;
+fieldParamsEwald.field.kspace_memory_limit_gb = cfg.field.kspace_memory_limit_gb;
+fieldParamsEwald.field.verbose = cfg.field.verbose;
+fieldParamsEwald.field.ewald = cfg.field.ewald;
 
-local_print_field_summary(cfg.periodic_method, EextPrimary, fieldPartsPrimary, ...
-    targetMask, fieldTimePrimary);
+tFieldEwald = tic;
+EextEwald = calc.compute_external_field(polsys, fieldParamsEwald);
+fieldTimeEwald = toc(tFieldEwald);
+
+fieldDirect = fieldParamsEwald.field;
+fieldDirect = rmfield(fieldDirect, 'mode');
+[~, fieldPartsEwald] = thole.induced_field_from_charges_periodic(polsys, fieldDirect);
+
+fprintf('  Ewald Eext computed in %.6f s\n', fieldTimeEwald);
+fprintf('  ||Eext||_F                 = %.12e\n', norm(EextEwald, 'fro'));
+fprintf('  ||Eext polarizable||_F     = %.12e\n', norm(EextEwald(targetMask, :), 'fro'));
+fprintf('  ||Ereal||_F                = %.12e\n', norm(fieldPartsEwald.real, 'fro'));
+fprintf('  ||Erecip||_F               = %.12e\n', norm(fieldPartsEwald.recip, 'fro'));
+fprintf('  ||Esurf||_F                = %.12e\n', norm(fieldPartsEwald.surf, 'fro'));
+fprintf('  field nK                   = %d\n', fieldPartsEwald.nK);
+fprintf('  field real entries         = %d\n', fieldPartsEwald.nRealEntries);
+fprintf('  field storage mode         = %s\n', fieldPartsEwald.storage_mode);
+fprintf('  selected source charge     = %+ .12e\n', fieldPartsEwald.qtot);
+
+if isfield(fieldPartsEwald, 'realCache') && ...
+        isfield(fieldPartsEwald.realCache, 'B_ewald') && ...
+        isfield(fieldPartsEwald.realCache, 'thole_delta')
+    fprintf('  ||field B_ewald||_2        = %.12e\n', norm(fieldPartsEwald.realCache.B_ewald));
+    fprintf('  ||field thole_delta||_2    = %.12e\n', norm(fieldPartsEwald.realCache.thole_delta));
+    fprintf('  thole/ewald coeff ratio    = %.12e\n', ...
+        norm(fieldPartsEwald.realCache.thole_delta) / max(norm(fieldPartsEwald.realCache.B_ewald), eps));
+end
 
 %% ------------------------------------------------------------------------
-% 8. Prepare primary SCF problem
+% 8. P3M external field
 % -------------------------------------------------------------------------
 
-fprintf('\n[8] Preparing primary SCF problem...\n');
+fprintf('\n[8] Computing periodic P3M external field...\n');
 
-problemPrimary = thole.prepare_scf_problem(polsys, EextPrimary, cfg.scf);
+fieldParamsP3M = struct();
+fieldParamsP3M.ewald = cfg.field.ewald;
+fieldParamsP3M.mesh_size = cfg.p3m.mesh_size;
+fieldParamsP3M.assignment_order = cfg.p3m.assignment_order;
+fieldParamsP3M.target_mask = targetMask;
+fieldParamsP3M.source_mask = sourceMask;
+fieldParamsP3M.exclude_self = cfg.field.exclude_self;
+fieldParamsP3M.use_thole_damping = cfg.field.use_thole_damping;
+fieldParamsP3M.realspace_backend = 'thole_periodic_real';
+fieldParamsP3M.derivative_mode = cfg.p3m.derivative_mode;
+fieldParamsP3M.influence_mode = cfg.p3m.influence_mode;
+fieldParamsP3M.fd_stencil = cfg.p3m.fd_stencil;
+fieldParamsP3M.deconvolve_assignment = cfg.p3m.deconvolve_assignment;
+fieldParamsP3M.deconvolution_floor = cfg.p3m.deconvolution_floor;
+fieldParamsP3M.alias_range = cfg.p3m.alias_range;
+fieldParamsP3M.verbose = cfg.field.verbose;
 
-fprintf('  nPolSites              = %d\n', problemPrimary.nPolSites);
-fprintf('  active vector length   = %d\n', numel(problemPrimary.Eext_pol_vec));
-fprintf('  ||Eext_pol_vec||       = %.12e\n', norm(problemPrimary.Eext_pol_vec));
+tFieldP3M = tic;
+[EextP3M, fieldPartsP3M] = p3m.compute_external_field_charges(polsys, fieldParamsP3M);
+fieldTimeP3M = toc(tFieldP3M);
+
+EextDiff = EextP3M(targetMask, :) - EextEwald(targetMask, :);
+EextRelDiff = norm(EextDiff, 'fro') / max(norm(EextEwald(targetMask, :), 'fro'), eps);
+EextCos = local_cosine(EextP3M(targetMask, :), EextEwald(targetMask, :));
+
+fprintf('  P3M Eext computed in %.6f s\n', fieldTimeP3M);
+fprintf('  ||Eext||_F                 = %.12e\n', norm(EextP3M, 'fro'));
+fprintf('  ||Eext polarizable||_F     = %.12e\n', norm(EextP3M(targetMask, :), 'fro'));
+fprintf('  ||Ereal||_F                = %.12e\n', norm(fieldPartsP3M.real, 'fro'));
+fprintf('  ||Erecip||_F               = %.12e\n', norm(fieldPartsP3M.recip, 'fro'));
+fprintf('  ||Esurf||_F                = %.12e\n', norm(fieldPartsP3M.surf, 'fro'));
+fprintf('  field nK mesh              = %d\n', fieldPartsP3M.nK);
+fprintf('  assigned rho total         = %+ .12e\n', fieldPartsP3M.rho_total);
+fprintf('  Eext P3M-Ewald rel diff    = %.12e\n', EextRelDiff);
+fprintf('  Eext P3M/Ewald cosine      = %.12f\n', EextCos);
 
 %% ------------------------------------------------------------------------
-% 9. Build primary operator
+% 9. Prepare SCF problems
 % -------------------------------------------------------------------------
 
-fprintf('\n[9] Building primary periodic operator (%s)...\n', cfg.periodic_method);
+fprintf('\n[9] Preparing SCF problems...\n');
 
-tOpPrimary = tic;
-opPrimary = local_build_operator_by_method(polsys, problemPrimary, cfg, cfg.periodic_method);
-opTimePrimary = toc(tOpPrimary);
+problemEwald = thole.prepare_scf_problem(polsys, EextEwald, cfg.scf);
+problemP3M = thole.prepare_scf_problem(polsys, EextP3M, cfg.scf);
 
-local_print_operator_summary(opPrimary, opTimePrimary, upper(cfg.periodic_method));
+fprintf('  nPolSites                  = %d\n', problemEwald.nPolSites);
+fprintf('  active vector length       = %d\n', numel(problemEwald.Eext_pol_vec));
+fprintf('  ||Eext_ewald_pol_vec||     = %.12e\n', norm(problemEwald.Eext_pol_vec));
+fprintf('  ||Eext_p3m_pol_vec||       = %.12e\n', norm(problemP3M.Eext_pol_vec));
+fprintf('  rel Eext_pol_vec diff      = %.12e\n', ...
+    norm(problemP3M.Eext_pol_vec - problemEwald.Eext_pol_vec) / max(norm(problemEwald.Eext_pol_vec), eps));
 
 %% ------------------------------------------------------------------------
-% 10. Operator apply timing
+% 10. Build periodic Ewald operator
 % -------------------------------------------------------------------------
 
-fprintf('\n[10] Timing primary operator apply...\n');
+fprintf('\n[10] Building periodic Ewald solver operator...\n');
+
+tOpEwald = tic;
+opEwald = thole.make_polarization_operator(polsys, problemEwald, ...
+    'Mode', 'periodic_ewald', ...
+    'Solver', cfg.solver.method, ...
+    'Backend', cfg.operator.backend, ...
+    'UseThole', cfg.operator.use_thole, ...
+    'Softening', cfg.operator.softening, ...
+    'Rcut', cfg.operator.rcut, ...
+    'Alpha', cfg.operator.alpha, ...
+    'Kcut', cfg.operator.kcut, ...
+    'Boundary', cfg.operator.boundary, ...
+    'KspaceMode', cfg.operator.kspace_mode, ...
+    'KBlockSize', cfg.operator.k_block_size, ...
+    'KspaceMemoryLimitGB', cfg.operator.kspace_memory_limit_gb, ...
+    'UseMex', cfg.operator.use_mex, ...
+    'UseMexKspace', cfg.operator.use_mex_kspace, ...
+    'Profile', cfg.operator.profile, ...
+    'Verbose', cfg.operator.verbose);
+opTimeEwald = toc(tOpEwald);
+
+local_print_operator_summary(opEwald, opTimeEwald, 'Ewald');
+
+%% ------------------------------------------------------------------------
+% 11. Build periodic P3M operator
+% -------------------------------------------------------------------------
+
+fprintf('\n[11] Building periodic P3M solver operator...\n');
+
+tOpP3M = tic;
+opP3M = thole.make_polarization_operator(polsys, problemP3M, ...
+    'Mode', 'periodic_p3m', ...
+    'Solver', cfg.solver.method, ...
+    'Backend', cfg.operator.backend, ...
+    'UseThole', cfg.operator.use_thole, ...
+    'Softening', cfg.operator.softening, ...
+    'Rcut', cfg.operator.rcut, ...
+    'Alpha', cfg.operator.alpha, ...
+    'Kcut', cfg.operator.kcut, ...
+    'Boundary', cfg.operator.boundary, ...
+    'MeshSize', cfg.p3m.mesh_size, ...
+    'AssignmentOrder', cfg.p3m.assignment_order, ...
+    'DerivativeMode', cfg.p3m.derivative_mode, ...
+    'InfluenceMode', cfg.p3m.influence_mode, ...
+    'FDStencil', cfg.p3m.fd_stencil, ...
+    'DeconvolveAssignment', cfg.p3m.deconvolve_assignment, ...
+    'DeconvolutionFloor', cfg.p3m.deconvolution_floor, ...
+    'AliasRange', cfg.p3m.alias_range, ...
+    'UseMex', cfg.operator.use_mex, ...
+    'Profile', cfg.operator.profile, ...
+    'Verbose', cfg.operator.verbose);
+opTimeP3M = toc(tOpP3M);
+
+local_print_operator_summary(opP3M, opTimeP3M, 'P3M');
+
+if isfield(opP3M, 'p3m_cache') && isfield(opP3M.p3m_cache, 'estimated_mesh_gb')
+    fprintf('  P3M estimated mesh storage = %.6f GB\n', opP3M.p3m_cache.estimated_mesh_gb);
+end
+
+%% ------------------------------------------------------------------------
+% 12. Operator apply timing
+% -------------------------------------------------------------------------
+
+fprintf('\n[12] Timing operator apply...\n');
 
 rng(123);
-xTest = randn(numel(problemPrimary.Eext_pol_vec), 1);
+xTest = randn(numel(problemEwald.Eext_pol_vec), 1);
 
-applyPrimary = local_time_apply(opPrimary, xTest, cfg.timing.apply_repeats);
+applyEwald = local_time_apply(opEwald, xTest, cfg.timing.apply_repeats);
+applyP3M = local_time_apply(opP3M, xTest, cfg.timing.apply_repeats);
 
-fprintf('  apply min             = %.6f s\n', applyPrimary.min);
-fprintf('  apply mean            = %.6f s\n', applyPrimary.mean);
-fprintf('  apply median          = %.6f s\n', applyPrimary.median);
-fprintf('  apply max             = %.6f s\n', applyPrimary.max);
+TxEwald = opEwald.apply(xTest);
+TxP3M = opP3M.apply(xTest);
 
-%% ------------------------------------------------------------------------
-% 11. Solve primary SCF
-% -------------------------------------------------------------------------
+applyFullRelDiff = norm(TxP3M - TxEwald) / max(norm(TxEwald), eps);
+applyCos = local_cosine(TxP3M, TxEwald);
 
-fprintf('\n[11] Solving primary SCF with %s...\n', cfg.solver.method);
-
-tSolvePrimary = tic;
-[muPrimary, solveInfoPrimary] = local_solve_selected(problemPrimary, opPrimary, cfg);
-solveWallPrimary = toc(tSolvePrimary);
-
-local_print_solver_summary(solveInfoPrimary, solveWallPrimary, muPrimary);
+fprintf('  Ewald apply median         = %.6f s\n', applyEwald.median);
+fprintf('  P3M apply median           = %.6f s\n', applyP3M.median);
+fprintf('  apply speedup Ewald/P3M    = %.6f x\n', applyEwald.median / max(applyP3M.median, eps));
+fprintf('  apply full rel diff        = %.12e\n', applyFullRelDiff);
+fprintf('  apply cosine               = %.12f\n', applyCos);
 
 %% ------------------------------------------------------------------------
-% 12. Primary energy
+% 13. Solve Ewald SCF
 % -------------------------------------------------------------------------
 
-fprintf('\n[12] Computing primary active-space polarization energy...\n');
+fprintf('\n[13] Solving Ewald SCF with %s...\n', cfg.solver.method);
 
-energyPrimary = calc.compute_total_energy_active_space( ...
-    polsys, problemPrimary, muPrimary, EextPrimary, opPrimary);
+tSolveEwald = tic;
+[muEwald, solveInfoEwald] = local_solve_selected(problemEwald, opEwald, cfg);
+solveWallEwald = toc(tSolveEwald);
 
-fprintf('\nPrimary %s energy breakdown:\n', upper(cfg.periodic_method));
-local_print_energy(energyPrimary, HARTREE_TO_EV);
+local_print_solver_summary(solveInfoEwald, solveWallEwald, muEwald);
 
 %% ------------------------------------------------------------------------
-% 13. Optional Ewald reference
+% 14. Solve P3M SCF
 % -------------------------------------------------------------------------
 
-reference = struct();
-reference.enabled = cfg.compare_to_ewald && ~strcmp(cfg.periodic_method, 'ewald');
+fprintf('\n[14] Solving P3M SCF with %s...\n', cfg.solver.method);
 
-if reference.enabled
-    fprintf('\n[13] Optional Ewald reference enabled...\n');
+tSolveP3M = tic;
+[muP3M, solveInfoP3M] = local_solve_selected(problemP3M, opP3M, cfg);
+solveWallP3M = toc(tSolveP3M);
 
-    tFieldRef = tic;
-    [EextRef, fieldPartsRef] = local_compute_external_field_by_method( ...
-        polsys, targetMask, sourceMask, cfg, 'ewald');
-    fieldTimeRef = toc(tFieldRef);
-
-    local_print_field_summary('ewald-reference', EextRef, fieldPartsRef, ...
-        targetMask, fieldTimeRef);
-
-    problemRef = thole.prepare_scf_problem(polsys, EextRef, cfg.scf);
-
-    tOpRef = tic;
-    opRef = local_build_operator_by_method(polsys, problemRef, cfg, 'ewald');
-    opTimeRef = toc(tOpRef);
-
-    local_print_operator_summary(opRef, opTimeRef, 'EWALD-REF');
-
-    applyRef = local_time_apply(opRef, xTest, cfg.timing.apply_repeats);
-
-    fprintf('\nReference operator apply timing:\n');
-    fprintf('  Ewald apply median    = %.6f s\n', applyRef.median);
-    fprintf('  primary apply median  = %.6f s\n', applyPrimary.median);
-    fprintf('  speedup Ewald/primary = %.6f x\n', applyRef.median / max(applyPrimary.median, eps));
-
-    tSolveRef = tic;
-    [muRef, solveInfoRef] = local_solve_selected(problemRef, opRef, cfg);
-    solveWallRef = toc(tSolveRef);
-
-    fprintf('\nReference Ewald solver summary:\n');
-    local_print_solver_summary(solveInfoRef, solveWallRef, muRef);
-
-    energyRef = calc.compute_total_energy_active_space( ...
-        polsys, problemRef, muRef, EextRef, opRef);
-
-    fprintf('\nReference Ewald energy breakdown:\n');
-    local_print_energy(energyRef, HARTREE_TO_EV);
-
-    reference.Eext = EextRef;
-    reference.fieldParts = fieldPartsRef;
-    reference.problem = problemRef;
-    reference.op = opRef;
-    reference.mu = muRef;
-    reference.solveInfo = solveInfoRef;
-    reference.energy = energyRef;
-    reference.fieldTime = fieldTimeRef;
-    reference.opTime = opTimeRef;
-    reference.apply = applyRef;
-    reference.solveWall = solveWallRef;
-else
-    fprintf('\n[13] Optional Ewald reference skipped.\n');
-end
+local_print_solver_summary(solveInfoP3M, solveWallP3M, muP3M);
 
 %% ------------------------------------------------------------------------
-% 14. Final summary
+% 15. Energies
 % -------------------------------------------------------------------------
 
-fprintf('\n============================================================\n');
-fprintf('Periodic polarization workflow summary\n');
-fprintf('============================================================\n');
+fprintf('\n[15] Computing active-space polarization energies...\n');
 
-primaryTotal = fieldTimePrimary + opTimePrimary + solveWallPrimary;
+energyEwald = calc.compute_total_energy_active_space( ...
+    polsys, problemEwald, muEwald, EextEwald, opEwald);
+
+energyP3M = calc.compute_total_energy_active_space( ...
+    polsys, problemP3M, muP3M, EextP3M, opP3M);
+
+fprintf('\nEwald energy breakdown:\n');
+local_print_energy(energyEwald, HARTREE_TO_EV);
+
+fprintf('\nP3M energy breakdown:\n');
+local_print_energy(energyP3M, HARTREE_TO_EV);
+
+muRelDiff = norm(muP3M - muEwald, 'fro') / max(norm(muEwald, 'fro'), eps);
+muCos = local_cosine(muP3M, muEwald);
+
+fprintf('\nEwald/P3M solution comparison:\n');
+fprintf('  ||mu Ewald||_F             = %.12e\n', norm(muEwald, 'fro'));
+fprintf('  ||mu P3M||_F               = %.12e\n', norm(muP3M, 'fro'));
+fprintf('  rel mu diff                = %.12e\n', muRelDiff);
+fprintf('  mu cosine                  = %.12f\n', muCos);
+fprintf('  energy diff total          = %+ .12e Ha (%+ .8f eV)\n', ...
+    energyP3M.total - energyEwald.total, ...
+    (energyP3M.total - energyEwald.total) * HARTREE_TO_EV);
+fprintf('  energy diff stationary     = %+ .12e Ha (%+ .8f eV)\n', ...
+    energyP3M.total_stationary - energyEwald.total_stationary, ...
+    (energyP3M.total_stationary - energyEwald.total_stationary) * HARTREE_TO_EV);
+
+%% ------------------------------------------------------------------------
+% 16. Timing summary table
+% -------------------------------------------------------------------------
+
+totalEwald = fieldTimeEwald + opTimeEwald + solveWallEwald;
+totalP3M = fieldTimeP3M + opTimeP3M + solveWallP3M;
 
 summary = table();
-summary.method = string(cfg.periodic_method);
-summary.field_time_s = fieldTimePrimary;
-summary.operator_build_time_s = opTimePrimary;
-summary.apply_median_s = applyPrimary.median;
-summary.solve_time_s = solveWallPrimary;
-summary.total_field_op_solve_s = primaryTotal;
-summary.energy_total_eV = energyPrimary.total * HARTREE_TO_EV;
-summary.energy_stationary_eV = energyPrimary.total_stationary * HARTREE_TO_EV;
-summary.solver_relres = local_get_numeric_field(solveInfoPrimary, 'relres', NaN);
-summary.converged = local_get_logical_field(solveInfoPrimary, 'converged', false);
+summary.method = ["ewald"; "p3m"];
+summary.field_time_s = [fieldTimeEwald; fieldTimeP3M];
+summary.operator_build_time_s = [opTimeEwald; opTimeP3M];
+summary.apply_median_s = [applyEwald.median; applyP3M.median];
+summary.solve_time_s = [solveWallEwald; solveWallP3M];
+summary.total_field_op_solve_s = [totalEwald; totalP3M];
+summary.energy_total_eV = [energyEwald.total; energyP3M.total] * HARTREE_TO_EV;
+summary.energy_stationary_eV = [energyEwald.total_stationary; energyP3M.total_stationary] * HARTREE_TO_EV;
+summary.solver_relres = [local_get_numeric_field(solveInfoEwald, 'relres', NaN); ...
+                         local_get_numeric_field(solveInfoP3M, 'relres', NaN)];
+summary.converged = [local_get_logical_field(solveInfoEwald, 'converged', false); ...
+                     local_get_logical_field(solveInfoP3M, 'converged', false)];
 
-if reference.enabled
-    refTotal = reference.fieldTime + reference.opTime + reference.solveWall;
-
-    summaryRef = table();
-    summaryRef.method = "ewald_reference";
-    summaryRef.field_time_s = reference.fieldTime;
-    summaryRef.operator_build_time_s = reference.opTime;
-    summaryRef.apply_median_s = reference.apply.median;
-    summaryRef.solve_time_s = reference.solveWall;
-    summaryRef.total_field_op_solve_s = refTotal;
-    summaryRef.energy_total_eV = reference.energy.total * HARTREE_TO_EV;
-    summaryRef.energy_stationary_eV = reference.energy.total_stationary * HARTREE_TO_EV;
-    summaryRef.solver_relres = local_get_numeric_field(reference.solveInfo, 'relres', NaN);
-    summaryRef.converged = local_get_logical_field(reference.solveInfo, 'converged', false);
-
-    summary = [summary; summaryRef]; %#ok<AGROW>
-end
-
+fprintf('\n============================================================\n');
+fprintf('Periodic Ewald vs P3M timing summary\n');
+fprintf('============================================================\n');
 disp(summary);
 
-fprintf('\nPrimary method details:\n');
-fprintf('  method                 = %s\n', cfg.periodic_method);
-fprintf('  backend                = %s\n', opPrimary.backend);
-fprintf('  solver                 = %s\n', cfg.solver.method);
-fprintf('  ref/nbr molecules      = %d / %d\n', ...
-    selection.reference_mol_id, selection.neighbor_mol_id);
-fprintf('  pair distance          = %.8f bohr\n', pairDistance0);
-fprintf('  Epol total             = %+ .8f eV\n', energyPrimary.total * HARTREE_TO_EV);
-fprintf('  Epol stationary        = %+ .8f eV\n', energyPrimary.total_stationary * HARTREE_TO_EV);
-fprintf('  stationary consistency = %+ .12e Ha\n', energyPrimary.stationary_consistency);
+fprintf('\nSpeedups / differences:\n');
+fprintf('  field speedup Ewald/P3M       = %.6f x\n', fieldTimeEwald / max(fieldTimeP3M, eps));
+fprintf('  op build speedup Ewald/P3M    = %.6f x\n', opTimeEwald / max(opTimeP3M, eps));
+fprintf('  apply speedup Ewald/P3M       = %.6f x\n', applyEwald.median / max(applyP3M.median, eps));
+fprintf('  solve speedup Ewald/P3M       = %.6f x\n', solveWallEwald / max(solveWallP3M, eps));
+fprintf('  total speedup Ewald/P3M       = %.6f x\n', totalEwald / max(totalP3M, eps));
+fprintf('  Eext P3M/Ewald rel diff       = %.12e\n', EextRelDiff);
+fprintf('  apply P3M/Ewald full rel diff = %.12e\n', applyFullRelDiff);
+fprintf('  mu P3M/Ewald rel diff         = %.12e\n', muRelDiff);
+fprintf('  Epol P3M-Ewald                = %+ .8f eV\n', ...
+    (energyP3M.total - energyEwald.total) * HARTREE_TO_EV);
 
-if strcmp(cfg.periodic_method, 'p3m')
-    fprintf('  P3M mesh               = [%d %d %d]\n', cfg.p3m.mesh_size);
-    fprintf('  P3M assignment order   = %d\n', cfg.p3m.assignment_order);
-end
-
-fprintf('  alpha                  = %.6g\n', cfg.ewald.alpha);
-fprintf('  rcut                   = %.6g bohr\n', cfg.ewald.rcut);
-fprintf('  kcut                   = %.6g bohr^-1\n', cfg.ewald.kcut);
-fprintf('  boundary               = %s\n', cfg.ewald.boundary);
-
-if reference.enabled
-    eextRel = norm(EextPrimary(targetMask,:) - reference.Eext(targetMask,:), 'fro') / ...
-        max(norm(reference.Eext(targetMask,:), 'fro'), eps);
-
-    muRel = norm(muPrimary - reference.mu, 'fro') / max(norm(reference.mu, 'fro'), eps);
-
-    fprintf('\nReference comparison to Ewald:\n');
-    fprintf('  Eext rel diff          = %.12e\n', eextRel);
-    fprintf('  Eext cosine            = %.12f\n', ...
-        local_cosine(EextPrimary(targetMask,:), reference.Eext(targetMask,:)));
-    fprintf('  mu rel diff            = %.12e\n', muRel);
-    fprintf('  mu cosine              = %.12f\n', local_cosine(muPrimary, reference.mu));
-    fprintf('  energy diff total      = %+ .12e Ha (%+ .8f eV)\n', ...
-        energyPrimary.total - reference.energy.total, ...
-        (energyPrimary.total - reference.energy.total) * HARTREE_TO_EV);
-    fprintf('  energy diff stationary = %+ .12e Ha (%+ .8f eV)\n', ...
-        energyPrimary.total_stationary - reference.energy.total_stationary, ...
-        (energyPrimary.total_stationary - reference.energy.total_stationary) * HARTREE_TO_EV);
-    fprintf('  apply speedup Ew/prim  = %.6f x\n', ...
-        reference.apply.median / max(applyPrimary.median, eps));
-    fprintf('  solve speedup Ew/prim  = %.6f x\n', ...
-        reference.solveWall / max(solveWallPrimary, eps));
-    fprintf('  total speedup Ew/prim  = %.6f x\n', ...
-        (reference.fieldTime + reference.opTime + reference.solveWall) / max(primaryTotal, eps));
-end
+fprintf('\nRun summary:\n');
+fprintf('  file             = %s\n', cfg.filename);
+fprintf('  supercell        = [%d %d %d]\n', cfg.supercellSize);
+fprintf('  relation/shell   = %s / %d\n', cfg.relation, cfg.shell);
+fprintf('  ref/nbr          = %d / %d\n', selection.reference_mol_id, selection.neighbor_mol_id);
+fprintf('  pair distance    = %.8f bohr\n', pairDistance0);
+fprintf('  charges          = [%+.3f %+.3f]\n', cfg.pairCharges);
+fprintf('  Ewald backend    = %s\n', opEwald.backend);
+fprintf('  P3M backend      = %s\n', opP3M.backend);
+fprintf('  P3M mesh         = [%d %d %d]\n', cfg.p3m.mesh_size);
+fprintf('  alpha            = %.6g\n', cfg.operator.alpha);
+fprintf('  rcut             = %.6g bohr\n', cfg.operator.rcut);
+fprintf('  kcut             = %.6g bohr^-1\n', cfg.operator.kcut);
+fprintf('  boundary         = %s\n', cfg.operator.boundary);
 
 fprintf('\nWorkflow completed successfully.\n');
 
@@ -636,149 +684,11 @@ fprintf('\nWorkflow completed successfully.\n');
 % Local helpers
 % =========================================================================
 
-function [Eext, parts] = local_compute_external_field_by_method( ...
-    polsys, targetMask, sourceMask, cfg, method)
-
-switch lower(method)
-    case 'ewald'
-        fieldParams = struct();
-        fieldParams.use_thole = cfg.field.use_thole_damping;
-        fieldParams.field = struct();
-        fieldParams.field.mode = 'periodic';
-        fieldParams.field.exclude_self = cfg.field.exclude_self;
-        fieldParams.field.use_thole_damping = cfg.field.use_thole_damping;
-        fieldParams.field.target_mask = targetMask;
-        fieldParams.field.source_mask = sourceMask;
-        fieldParams.field.real_only = false;
-        fieldParams.field.kspace_mode = cfg.ewald.kspace_mode;
-        fieldParams.field.k_block_size = cfg.ewald.k_block_size;
-        fieldParams.field.kspace_memory_limit_gb = cfg.ewald.kspace_memory_limit_gb;
-        fieldParams.field.verbose = cfg.field.verbose;
-
-        fieldParams.field.ewald = struct();
-        fieldParams.field.ewald.alpha = cfg.ewald.alpha;
-        fieldParams.field.ewald.rcut = cfg.ewald.rcut;
-        fieldParams.field.ewald.kcut = cfg.ewald.kcut;
-        fieldParams.field.ewald.boundary = cfg.ewald.boundary;
-
-        Eext = calc.compute_external_field(polsys, fieldParams);
-
-        directParams = fieldParams.field;
-        directParams = rmfield(directParams, 'mode');
-        [~, parts] = thole.induced_field_from_charges_periodic(polsys, directParams);
-
-    case 'p3m'
-        p3mParams = struct();
-
-        p3mParams.ewald = struct();
-        p3mParams.ewald.alpha = cfg.ewald.alpha;
-        p3mParams.ewald.rcut = cfg.ewald.rcut;
-        p3mParams.ewald.kcut = cfg.ewald.kcut;
-        p3mParams.ewald.boundary = cfg.ewald.boundary;
-
-        p3mParams.mesh_size = cfg.p3m.mesh_size;
-        p3mParams.assignment_order = cfg.p3m.assignment_order;
-
-        p3mParams.target_mask = targetMask;
-        p3mParams.source_mask = sourceMask;
-        p3mParams.exclude_self = cfg.field.exclude_self;
-        p3mParams.use_thole_damping = cfg.field.use_thole_damping;
-
-        p3mParams.realspace_backend = 'thole_periodic_real';
-
-        p3mParams.derivative_mode = cfg.p3m.derivative_mode;
-        p3mParams.influence_mode = cfg.p3m.influence_mode;
-        p3mParams.fd_stencil = cfg.p3m.fd_stencil;
-
-        p3mParams.deconvolve_assignment = cfg.p3m.deconvolve_assignment;
-        p3mParams.deconvolution_floor = cfg.p3m.deconvolution_floor;
-        p3mParams.alias_range = cfg.p3m.alias_range;
-
-        p3mParams.verbose = cfg.field.verbose;
-
-        [Eext, parts] = p3m.compute_external_field_charges(polsys, p3mParams);
-
-    case 'nonperiodic'
-        fieldParams = struct();
-        fieldParams.use_thole = cfg.field.use_thole_damping;
-    
-        fieldParams.field = struct();
-        fieldParams.field.mode = 'nonperiodic';
-        fieldParams.field.exclude_self = cfg.field.exclude_self;
-        fieldParams.field.use_thole_damping = cfg.field.use_thole_damping;
-        fieldParams.field.target_mask = targetMask;
-        fieldParams.field.source_mask = sourceMask;
-        fieldParams.field.verbose = cfg.field.verbose;
-    
-        Eext = calc.compute_external_field(polsys, fieldParams);
-    
-        parts = struct();
-        parts.real = Eext;
-        parts.recip = zeros(size(Eext));
-        parts.surf = zeros(size(Eext));
-        parts.nK = 0;
-        parts.mode = 'nonperiodic';
-
-    otherwise
-        error('Unsupported periodic method "%s".', method);
-end
-end
-
-function op = local_build_operator_by_method(polsys, problem, cfg, method)
-switch lower(method)
-    case 'ewald'
-        op = thole.make_polarization_operator(polsys, problem, ...
-            'Mode', 'periodic_ewald', ...
-            'Solver', cfg.solver.method, ...
-            'Backend', cfg.operator.backend, ...
-            'UseThole', cfg.operator.use_thole, ...
-            'Softening', cfg.operator.softening, ...
-            'Rcut', cfg.ewald.rcut, ...
-            'Alpha', cfg.ewald.alpha, ...
-            'Kcut', cfg.ewald.kcut, ...
-            'Boundary', cfg.ewald.boundary, ...
-            'KspaceMode', cfg.ewald.kspace_mode, ...
-            'KBlockSize', cfg.ewald.k_block_size, ...
-            'KspaceMemoryLimitGB', cfg.ewald.kspace_memory_limit_gb, ...
-            'UseMex', cfg.operator.use_mex, ...
-            'UseMexKspace', cfg.operator.use_mex_kspace, ...
-            'Profile', cfg.operator.profile, ...
-            'Verbose', cfg.operator.verbose);
-
-    case 'p3m'
-        op = thole.make_polarization_operator(polsys, problem, ...
-            'Mode', 'periodic_p3m', ...
-            'Solver', cfg.solver.method, ...
-            'Backend', cfg.operator.backend, ...
-            'UseThole', cfg.operator.use_thole, ...
-            'Softening', cfg.operator.softening, ...
-            'Rcut', cfg.ewald.rcut, ...
-            'Alpha', cfg.ewald.alpha, ...
-            'Kcut', cfg.ewald.kcut, ...
-            'Boundary', cfg.ewald.boundary, ...
-            'MeshSize', cfg.p3m.mesh_size, ...
-            'AssignmentOrder', cfg.p3m.assignment_order, ...
-            'DerivativeMode', cfg.p3m.derivative_mode, ...
-            'InfluenceMode', cfg.p3m.influence_mode, ...
-            'FDStencil', cfg.p3m.fd_stencil, ...
-            'DeconvolveAssignment', cfg.p3m.deconvolve_assignment, ...
-            'DeconvolutionFloor', cfg.p3m.deconvolution_floor, ...
-            'AliasRange', cfg.p3m.alias_range, ...
-            'UseMex', cfg.operator.use_mex, ...
-            'Profile', cfg.operator.profile, ...
-            'Verbose', cfg.operator.verbose);
-
-    otherwise
-        error('Unsupported periodic method "%s".', method);
-end
-end
-
 function [mu, solveInfo] = local_solve_selected(problem, op, cfg)
 switch lower(cfg.solver.method)
     case 'direct'
         solveOpts = struct();
         solveOpts.compute_residual = cfg.solver.compute_residual;
-
         [mu, solveInfo] = thole.solve_scf_direct(problem, op, solveOpts);
 
     case 'jacobi'
@@ -788,7 +698,6 @@ switch lower(cfg.solver.method)
         solveOpts.mixing = cfg.solver.jacobi_mixing;
         solveOpts.stop_metric = cfg.solver.stop_metric;
         solveOpts.verbose = cfg.scf.verbose;
-
         [mu, solveInfo] = thole.solve_scf_jacobi(problem, op, solveOpts);
 
     case 'gmres'
@@ -797,7 +706,6 @@ switch lower(cfg.solver.method)
         solveOpts.max_iter = cfg.scf.maxIter;
         solveOpts.restart = cfg.solver.gmres_restart;
         solveOpts.verbose = cfg.scf.verbose;
-
         [mu, solveInfo] = thole.solve_scf_gmres(problem, op, solveOpts);
 
     case 'sor'
@@ -808,7 +716,6 @@ switch lower(cfg.solver.method)
         solveOpts.stop_metric = cfg.solver.stop_metric;
         solveOpts.residual_every = cfg.solver.sor_residual_every;
         solveOpts.verbose = cfg.scf.verbose;
-
         [mu, solveInfo] = thole.solve_scf_sor(problem, op, solveOpts);
 
     otherwise
@@ -819,6 +726,7 @@ end
 function stats = local_time_apply(op, x, nRepeat)
 times = zeros(nRepeat, 1);
 
+% Warmup.
 op.apply(x);
 
 for kk = 1:nRepeat
@@ -833,39 +741,6 @@ stats.min = min(times);
 stats.mean = mean(times);
 stats.median = median(times);
 stats.max = max(times);
-end
-
-function local_print_field_summary(label, Eext, parts, targetMask, elapsed)
-fprintf('  %s Eext computed in %.6f s\n', label, elapsed);
-fprintf('  ||Eext||_F                 = %.12e\n', norm(Eext, 'fro'));
-fprintf('  ||Eext polarizable||_F     = %.12e\n', norm(Eext(targetMask, :), 'fro'));
-
-if isstruct(parts)
-    if isfield(parts, 'real')
-        fprintf('  ||Ereal||_F                = %.12e\n', norm(parts.real, 'fro'));
-    end
-    if isfield(parts, 'recip')
-        fprintf('  ||Erecip||_F               = %.12e\n', norm(parts.recip, 'fro'));
-    end
-    if isfield(parts, 'surf')
-        fprintf('  ||Esurf||_F                = %.12e\n', norm(parts.surf, 'fro'));
-    end
-    if isfield(parts, 'nK')
-        fprintf('  field nK                   = %d\n', parts.nK);
-    end
-    if isfield(parts, 'nRealEntries')
-        fprintf('  field real entries         = %d\n', parts.nRealEntries);
-    end
-    if isfield(parts, 'storage_mode')
-        fprintf('  field storage mode         = %s\n', parts.storage_mode);
-    end
-    if isfield(parts, 'qtot')
-        fprintf('  selected source charge     = %+ .12e\n', parts.qtot);
-    end
-    if isfield(parts, 'rho_total')
-        fprintf('  assigned rho total         = %+ .12e\n', parts.rho_total);
-    end
-end
 end
 
 function local_print_operator_summary(op, elapsed, label)
@@ -899,6 +774,21 @@ if isfield(op, 'info')
     if isfield(info, 'p3m_cache_time')
         fprintf('  %s p3m cache time              = %.6f s\n', label, info.p3m_cache_time);
     end
+    if isfield(info, 'fill_time')
+        fprintf('  %s opinfo fill time            = %.6f s\n', label, info.fill_time);
+    end
+    if isfield(info, 'nPairBlocks')
+        fprintf('  %s pair blocks total           = %d\n', label, info.nPairBlocks);
+    end
+    if isfield(info, 'nPairBlocksKept')
+        fprintf('  %s pair blocks kept            = %d\n', label, info.nPairBlocksKept);
+    end
+    if isfield(info, 'nPairBlocksSkippedCutoff')
+        fprintf('  %s skipped by cutoff           = %d\n', label, info.nPairBlocksSkippedCutoff);
+    end
+    if isfield(info, 'nEntriesDirected')
+        fprintf('  %s directed row entries        = %d\n', label, info.nEntriesDirected);
+    end
     if isfield(info, 'nRealEntriesDirected')
         fprintf('  %s real directed entries       = %d\n', label, info.nRealEntriesDirected);
     end
@@ -925,11 +815,6 @@ if isfield(op, 'info')
         fprintf('  %s boundary                    = %s\n', label, info.boundary);
     end
 end
-
-if isfield(op, 'p3m_cache') && isfield(op.p3m_cache, 'estimated_mesh_gb')
-    fprintf('  %s estimated mesh storage      = %.6f GB\n', ...
-        label, op.p3m_cache.estimated_mesh_gb);
-end
 end
 
 function local_print_solver_summary(info, wallTime, mu)
@@ -937,6 +822,12 @@ fprintf('  solve wall time       = %.6f s\n', wallTime);
 
 if isfield(info, 'solve_time')
     fprintf('  solver internal time  = %.6f s\n', info.solve_time);
+end
+if isfield(info, 'setup_time')
+    fprintf('  setup time            = %.6f s\n', info.setup_time);
+end
+if isfield(info, 'residual_time')
+    fprintf('  residual time         = %.6f s\n', info.residual_time);
 end
 if isfield(info, 'final_residual_time')
     fprintf('  final residual time   = %.6f s\n', info.final_residual_time);
@@ -950,17 +841,11 @@ end
 if isfield(info, 'stop_metric')
     fprintf('  stop metric           = %s\n', info.stop_metric);
 end
-if isfield(info, 'stop_value')
-    fprintf('  stop value            = %.12e\n', info.stop_value);
-end
 if isfield(info, 'iterations')
     fprintf('  iterations            = %d\n', info.iterations);
 end
 if isfield(info, 'max_iter')
     fprintf('  max iterations        = %d\n', info.max_iter);
-end
-if isfield(info, 'omega')
-    fprintf('  SOR omega             = %.12e\n', info.omega);
 end
 if isfield(info, 'restart')
     if isempty(info.restart)
